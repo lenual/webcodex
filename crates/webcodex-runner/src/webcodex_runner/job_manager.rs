@@ -12,9 +12,10 @@ use super::detached_job::{
 use super::output_text::OutputTextSource;
 use super::runner_skills::run_skill_resource_with_profiles_and_execution_state;
 use super::shell::{
-    configured_prepared_shell_job_command, configured_shell_job_command,
-    configured_validation_job_command, cwd_allowed, prepare_detached_process_launch,
-    resolve_prepared_shell_profile, run_process_with_profiles_and_execution_state_with_start_hook,
+    configured_explicit_shell_command, configured_prepared_shell_job_command,
+    configured_shell_job_command, configured_validation_job_command, cwd_allowed,
+    prepare_detached_process_launch, resolve_prepared_shell_profile,
+    run_process_with_profiles_and_execution_state_with_start_hook,
     run_script_with_profiles_and_execution_state_with_start_hook, PreparedShellProfileCache,
 };
 use super::shutdown::{lock_unpoison, ActivityTracker};
@@ -39,6 +40,7 @@ use webcodex_core::runner_protocol::{
     JOB_INVENTORY_MAX_TERMINAL_JOBS, JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS,
     VALIDATION_STEP_SPAWN_FAILED_CODE, VALIDATION_TOOL_UNAVAILABLE_CODE,
 };
+use webcodex_core::workflow_session_contract::ExecutionShell;
 use webcodex_process::ManagedChild;
 // Existing process-I/O / execution helpers deliberately remain at their current
 // owner. Extracting those independent facilities is outside this refactor.
@@ -251,6 +253,10 @@ pub(crate) struct JobManager {
     workers: ActivityTracker,
     current_sink: Arc<Mutex<Option<RunnerSink>>>,
     pending_job_updates: Arc<Mutex<HashMap<String, JobUpdateDeliveryQueue>>>,
+    /// Orders the gap between assigning/observing an update sequence and making
+    /// that update visible to the delivery worker. The worker holds this only
+    /// while selecting a candidate; transport I/O always happens after release.
+    job_update_delivery_order: Arc<Mutex<()>>,
     delivery_signal: Arc<JobUpdateDeliverySignal>,
     owner_lifetime: Option<Arc<JobManagerOwnerLifetime>>,
     detached_profile_server_url: String,
@@ -267,11 +273,13 @@ impl JobManager {
         let shutting_down = Arc::new(AtomicBool::new(false));
         let current_sink = Arc::new(Mutex::new(None));
         let pending_job_updates = Arc::new(Mutex::new(HashMap::new()));
+        let job_update_delivery_order = Arc::new(Mutex::new(()));
         let delivery_signal = Arc::new(JobUpdateDeliverySignal::default());
         spawn_job_update_delivery_worker(
             Arc::downgrade(&jobs),
             Arc::downgrade(&current_sink),
             Arc::downgrade(&pending_job_updates),
+            Arc::downgrade(&job_update_delivery_order),
             Arc::clone(&delivery_signal),
         );
         let owner_lifetime = Arc::new(JobManagerOwnerLifetime {
@@ -292,6 +300,7 @@ impl JobManager {
             workers: ActivityTracker::default(),
             current_sink,
             pending_job_updates,
+            job_update_delivery_order,
             delivery_signal,
             owner_lifetime: Some(owner_lifetime),
             detached_profile_server_url: String::new(),
@@ -389,20 +398,53 @@ impl JobUpdateDeliveryQueue {
             return true;
         }
         if semantic {
-            self.output_only = None;
-            if let Some(last) = self.required.back_mut() {
-                if last.update_seq == update.update_seq {
-                    *last = update;
-                    return true;
-                }
+            if self
+                .output_only
+                .as_ref()
+                .is_some_and(|pending| pending.update_seq <= update.update_seq)
+            {
+                self.output_only = None;
+            }
+            if let Some(existing) = self
+                .required
+                .iter_mut()
+                .find(|pending| pending.update_seq == update.update_seq)
+            {
+                *existing = update;
+                return true;
             }
             if self.required.len() >= JOB_UPDATE_REQUIRED_PENDING_MAX {
                 self.required.clear();
                 self.suspended_until_reconciliation = true;
                 return false;
             }
-            self.required.push_back(update);
+            let insert_at = self
+                .required
+                .iter()
+                .position(|pending| pending.update_seq > update.update_seq)
+                .unwrap_or(self.required.len());
+            self.required.insert(insert_at, update);
         } else {
+            // Update generation happens under the Job map lock, while queue
+            // insertion happens later under the delivery lock. A newer semantic
+            // update can therefore overtake an older heartbeat/output-only update
+            // between those locks. Never retain that stale update behind newer
+            // required truth: a legacy/non-sequenced Server would otherwise see
+            // the semantic state and then regress when the queue drains.
+            if self
+                .required
+                .iter()
+                .any(|required| required.update_seq >= update.update_seq)
+            {
+                return true;
+            }
+            if self
+                .output_only
+                .as_ref()
+                .is_some_and(|pending| pending.update_seq >= update.update_seq)
+            {
+                return true;
+            }
             self.output_only = Some(update);
         }
         true
@@ -477,6 +519,7 @@ fn spawn_job_update_delivery_worker(
     jobs: Weak<Mutex<HashMap<String, RunningJob>>>,
     current_sink: Weak<Mutex<Option<RunnerSink>>>,
     pending_job_updates: Weak<Mutex<HashMap<String, JobUpdateDeliveryQueue>>>,
+    job_update_delivery_order: Weak<Mutex<()>>,
     signal: Arc<JobUpdateDeliverySignal>,
 ) {
     std::thread::spawn(move || {
@@ -485,7 +528,15 @@ fn spawn_job_update_delivery_worker(
             let Some(pending_map) = pending_job_updates.upgrade() else {
                 break;
             };
+            let Some(delivery_order) = job_update_delivery_order.upgrade() else {
+                break;
+            };
             let candidate = {
+                // A producer holds this from sequence assignment/snapshot
+                // observation through queue insertion. Selecting under the same
+                // gate prevents a higher sequence from escaping while an older
+                // generated update is still between the Job and delivery locks.
+                let _delivery_order = lock_unpoison(&delivery_order);
                 let pending = lock_unpoison(&pending_map);
                 pending.iter().find_map(|(job_id, queue)| {
                     queue.next().cloned().map(|update| (job_id.clone(), update))
@@ -882,8 +933,6 @@ fn job_update_from_snapshot(
         status: snapshot.status.clone(),
         stdout_chunk: None,
         stderr_chunk: None,
-        stdout_tail: None,
-        stderr_tail: None,
         log_snapshot: Some(ShellJobLogSnapshot {
             stdout: snapshot.stdout.clone(),
             stderr: snapshot.stderr.clone(),
@@ -1164,6 +1213,7 @@ fn validate_runner_job_context_operation(
             shell,
             "sh" | "bash"
                 | "powershell"
+                | "python"
                 | "javascript"
                 | "typescript"
                 | "configured"
@@ -1499,6 +1549,7 @@ impl JobManager {
     }
 
     fn update_and_send(&self, job_id: &str, delta: RunnerJobDelta) {
+        let _delivery_order = lock_unpoison(&self.job_update_delivery_order);
         if let Some((update, semantic)) = self.record_update(job_id, delta) {
             self.queue_recorded_update(update, semantic);
         }
@@ -1508,6 +1559,7 @@ impl JobManager {
         if self.current_sink().is_none() {
             return;
         }
+        let _delivery_order = lock_unpoison(&self.job_update_delivery_order);
         let registered_by_job = registered
             .jobs
             .iter()
@@ -1575,6 +1627,7 @@ impl JobManager {
     }
 
     fn resend_snapshot(&self, job_id: &str) {
+        let _delivery_order = lock_unpoison(&self.job_update_delivery_order);
         let update = lock_unpoison(&self.jobs).get(job_id).map(|job| {
             job_update_from_snapshot(&job.client_id, &job.runner_instance_id, &job.snapshot)
         });
@@ -1866,6 +1919,7 @@ impl JobManager {
         record: &super::detached_job::DetachedJobRecord,
     ) -> Result<bool, String> {
         let snapshot = snapshot_from_detached_record(record)?;
+        let delivery_order = lock_unpoison(&self.job_update_delivery_order);
         let (update, terminal, semantic) = {
             let mut jobs = lock_unpoison(&self.jobs);
             let job = jobs
@@ -1910,6 +1964,7 @@ impl JobManager {
             )
         };
         self.queue_recorded_update(update, terminal || semantic);
+        drop(delivery_order);
         if terminal {
             lock_unpoison(&self.detached_jobs).remove(job_id);
             self.start_available_queued();
@@ -2078,8 +2133,6 @@ impl JobManager {
                 status: "failed".to_string(),
                 stdout_chunk: None,
                 stderr_chunk: None,
-                stdout_tail: None,
-                stderr_tail: None,
                 log_snapshot: None,
                 exit_code: None,
                 duration_ms: Some(0),
@@ -2561,12 +2614,23 @@ impl JobManager {
             operation,
             ..
         } = start;
-        let (job_id, cwd, raw_command, steps, timeout_secs, context, validation) = match &operation
-        {
+        let (
+            job_id,
+            cwd,
+            raw_command,
+            explicit_shell,
+            login,
+            steps,
+            timeout_secs,
+            context,
+            validation,
+        ) = match &operation {
             RunnerJobOperation::StartShell(request) => (
                 request.job_id.clone(),
                 request.cwd.clone(),
                 Some(request.command.clone()),
+                request.shell,
+                request.login,
                 Vec::new(),
                 request.timeout_secs,
                 request.context.clone(),
@@ -2576,6 +2640,8 @@ impl JobManager {
                 request.job_id.clone(),
                 request.cwd.clone(),
                 None,
+                None,
+                false,
                 request.steps.clone(),
                 request.timeout_secs,
                 request.context.clone(),
@@ -2588,6 +2654,14 @@ impl JobManager {
                 && metadata.kind == "test"
                 && metadata.no_run != Some(true)
         });
+        if login && explicit_shell != Some(ExecutionShell::Bash) {
+            self.fail_job(
+                &operation,
+                "bash login mode requires shell=bash".to_string(),
+                None,
+            );
+            return;
+        }
         if !policy.allow_raw_shell {
             self.fail_job(
                 &operation,
@@ -2660,9 +2734,20 @@ impl JobManager {
                 let raw_command = raw_command
                     .as_deref()
                     .expect("typed raw shell Job carries command text");
-                match prepared_profile.as_deref() {
-                    Some(profile) => configured_prepared_shell_job_command(profile, raw_command),
-                    None => configured_shell_job_command(&shell, raw_command),
+                match explicit_shell {
+                    Some(selection) => configured_explicit_shell_command(
+                        &shell,
+                        prepared_profile.as_deref(),
+                        selection,
+                        login,
+                        raw_command,
+                    ),
+                    None => match prepared_profile.as_deref() {
+                        Some(profile) => {
+                            configured_prepared_shell_job_command(profile, raw_command)
+                        }
+                        None => configured_shell_job_command(&shell, raw_command),
+                    },
                 }
             };
             let mut command = match configured {
@@ -2680,8 +2765,13 @@ impl JobManager {
                         .map(|(key, value)| (key.as_str(), value.as_str())),
                 );
             }
+            // Raw Shell Jobs and every validation step have no stdin payload.
+            // Never inherit the Runner's parent-liveness pipe: it stays open
+            // while Desktop is alive and can stall native commands or let a
+            // child consume input owned by the Runner. Match the sync path.
             command
                 .current_dir(&cwd_path)
+                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             commands.push_back(command);

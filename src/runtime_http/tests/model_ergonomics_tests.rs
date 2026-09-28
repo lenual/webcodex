@@ -37,7 +37,7 @@ async fn api_model_ergonomics_success_is_exact_and_queryable() {
     let mut response = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
         .add_header("x-action-session-id", "ergonomics-success", true)
-        .json(&json!({"tool": "tool_manifest", "intent": "audit"}))
+        .json(&json!({"tool": "tool_manifest", "params": {"intent": "audit"}}))
         .send(&service)
         .await;
     assert_eq!(super::effective_status(&response), StatusCode::OK);
@@ -45,7 +45,7 @@ async fn api_model_ergonomics_success_is_exact_and_queryable() {
     assert_eq!(body["success"], true);
 
     let telemetry = single_model_ergonomics(&db, "ergonomics-success", "tool_manifest");
-    assert_eq!(telemetry["schema_version"], 7);
+    assert_eq!(telemetry["schema_version"], 11);
     assert_eq!(telemetry["tool_name"], "tool_manifest");
     assert_eq!(telemetry["tool_category"], "runtime");
     assert_eq!(telemetry["success"], true);
@@ -76,7 +76,7 @@ async fn api_model_ergonomics_failure_uses_structured_kinds_without_private_text
     let mut response = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
         .add_header("x-action-session-id", "ergonomics-failure", true)
-        .json(&json!({"tool": "project_overview", "project": private_project}))
+        .json(&json!({"tool": "project_overview", "params": {"project": private_project}}))
         .send(&service)
         .await;
     assert_eq!(super::effective_status(&response), StatusCode::BAD_REQUEST);
@@ -154,11 +154,13 @@ async fn api_batch_call_records_one_generic_outer_invocation() {
         .add_header("x-action-session-id", "ergonomics-batch", true)
         .json(&json!({
             "tool": "read_files",
-            "project": "agent:importer:demo",
-            "items": [
-                {"path": "missing-a.rs"},
-                {"path": "missing-b.rs"}
-            ]
+            "params": {
+                "project": "agent:importer:demo",
+                "items": [
+                    {"path": "missing-a.rs"},
+                    {"path": "missing-b.rs"}
+                ]
+            }
         }))
         .send(&service)
         .await;
@@ -195,9 +197,12 @@ async fn api_work_on_project_preferences_persist_as_privacy_bounded_action_audit
         .add_header("x-action-session-id", "ergonomics-work-on-project", true)
         .json(&json!({
             "tool": "work_on_project",
-            "project": project,
-            "instruction": private_instruction,
-            "include_extension_catalog": false
+            "params": {
+                "project": project,
+                "instruction": private_instruction,
+                "guidance_profile": "host_code_mode",
+                "include_extension_catalog": false
+            }
         }))
         .send(&service)
         .await;
@@ -208,17 +213,27 @@ async fn api_work_on_project_preferences_persist_as_privacy_bounded_action_audit
     assert_eq!(body["success"], true, "{body}");
 
     let telemetry = single_model_ergonomics(&db, "ergonomics-work-on-project", "work_on_project");
-    assert_eq!(telemetry["schema_version"], 7);
+    assert_eq!(telemetry["schema_version"], 11);
     let facts = &telemetry["work_on_project"];
     assert_eq!(facts["resume_requested"], false);
     assert_eq!(facts["source"], "project");
     assert_eq!(facts["mode"], "checkout");
     assert_eq!(facts["mode_explicit"], false);
     assert_eq!(facts["base_ref_present"], false);
-    assert_eq!(facts["guidance_profile"], "direct");
-    assert_eq!(facts["guidance_profile_explicit"], false);
+    assert_eq!(facts["guidance_profile"], "host_code_mode");
+    assert_eq!(facts["guidance_profile_explicit"], true);
     assert_eq!(facts["include_extension_catalog"], false);
     assert_eq!(facts["include_extension_catalog_explicit"], true);
+    let invocation = &telemetry["invocation"];
+    assert_eq!(invocation["context_present"], false);
+    assert_eq!(invocation["control_present"], false);
+    let bootstrap = &telemetry["bootstrap"];
+    assert!(bootstrap.is_object());
+    assert!(bootstrap["instructions_available"].is_null());
+    assert!(bootstrap["workflow_available"].is_null());
+    assert!(bootstrap["instruction_observation_status"].is_string());
+    assert!(bootstrap["workspace_status"].is_string());
+    assert!(bootstrap["semantic_supported"].is_boolean());
     let serialized = serde_json::to_string(&telemetry).unwrap();
     for forbidden in [private_instruction, project] {
         assert!(
@@ -244,7 +259,7 @@ async fn action_audit_sink_failure_never_changes_success_or_failure_tool_result(
 
     let mut success = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
-        .json(&json!({"tool": "tool_manifest", "intent": "audit"}))
+        .json(&json!({"tool": "tool_manifest", "params": {"intent": "audit"}}))
         .send(&service)
         .await;
     assert_eq!(super::effective_status(&success), StatusCode::OK);
@@ -254,7 +269,7 @@ async fn action_audit_sink_failure_never_changes_success_or_failure_tool_result(
 
     let mut failure = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
-        .json(&json!({"tool": "project_overview", "project": "missing-project"}))
+        .json(&json!({"tool": "project_overview", "params": {"project": "missing-project"}}))
         .send(&service)
         .await;
     assert_eq!(super::effective_status(&failure), StatusCode::BAD_REQUEST);

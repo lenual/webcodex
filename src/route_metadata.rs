@@ -94,7 +94,11 @@ pub(crate) enum RouteId {
     RuntimeConsoleRunner,
     RuntimeConsoleWindows,
     RuntimeConsoleWindow,
+    RuntimeConsoleWindowCollaboration,
+    RuntimeConsoleWindowCollaborationPost,
     RuntimeConsoleProjects,
+    RuntimeConsoleGoals,
+    RuntimeConsoleGoal,
     RuntimeConsoleExtensions,
     RuntimeConsoleInstruction,
     RuntimeConsoleProjectGit,
@@ -131,6 +135,7 @@ pub(crate) enum RouteId {
     ArtifactsImport,
     ProjectsResolveOrRegister,
     RuntimeStatus,
+    RuntimeUpgradeMaintenance,
     OAuthClientsCreate,
     OAuthClientsList,
     OAuthClientsUpdateScopes,
@@ -150,6 +155,8 @@ pub(crate) enum RouteId {
     AgentTokensList,
     AgentTokensRevoke,
     PairingCreate,
+    PairingRunnerCapabilities,
+    RunnerCapabilityAuthorization,
     ShellRun,
     ShellFile,
     ShellJob,
@@ -167,6 +174,7 @@ pub(crate) enum RouteId {
     AuditSessions,
     AuditSession,
     AuditStats,
+    Healthz,
     OpenApiDocument,
     RuntimeWebRoot,
     RuntimeWebAppJs,
@@ -249,7 +257,7 @@ pub(crate) fn spec(id: RouteId) -> &'static RouteSpec {
         .unwrap_or_else(|| panic!("RouteId {id:?} has no canonical RouteSpec"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-gpt-actions"))]
 pub(crate) fn path(id: RouteId) -> &'static str {
     spec(id).path
 }
@@ -574,7 +582,7 @@ mod tests {
         let routes = iter_routes()
             .filter(|spec| spec.surface == PublicWeb)
             .collect::<Vec<_>>();
-        assert_eq!(routes.len(), 7);
+        assert_eq!(routes.len(), 8);
         for route in routes {
             assert_eq!(route.method, RouteMethod::Get, "{:?}", route.id);
             assert_eq!(
@@ -679,7 +687,7 @@ mod tests {
             assert_eq!(audit_class_for_path(path), Some(class), "{path}");
         }
         for (tool, class) in [
-            ("apply_text_edits", Edit),
+            ("edit_project_files", Edit),
             ("run_shell", Shell),
             ("import_conversation_files_to_project", Artifact),
             ("git_diff_hunks", Git),

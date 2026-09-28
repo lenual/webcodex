@@ -315,9 +315,10 @@ fn decorate(
 }
 
 impl ToolRuntime {
-    /// Advisory conversion only, before execution. The explicit-shell wrapper
-    /// requires a known POSIX Runner execution dialect. No target, stdin,
-    /// expectation, login-shell or positional-argv semantics may be guessed.
+    /// Build a canonical shell call only for exact, lossless process forms.
+    /// The caller re-enters shell authorization and policy before dispatch.
+    /// Runner capabilities must advertise explicit shell selection and, for
+    /// Bash login mode, support for that exact mode.
     pub(super) async fn process_shell_recovery_call(
         &self,
         call: &super::ToolCall,
@@ -339,9 +340,10 @@ impl ToolRuntime {
         else {
             return None;
         };
+        let login = executable == "bash" && args.first().is_some_and(|flag| flag == "-lc");
         if !matches!(executable.as_str(), "sh" | "bash")
             || args.len() != 2
-            || args[0] != "-c"
+            || !(args[0] == "-c" || login)
             || stdin.is_some()
             || cwd
                 .as_ref()
@@ -365,38 +367,37 @@ impl ToolRuntime {
             .err()
             .as_deref()
             != Some(
-                "run_process does not accept shell command modes; use run_shell for shell syntax",
+                "run_process does not accept shell command modes; use run_shell for shell grammar/short chains or run_script for program-like scripts",
             )
         {
             return None;
         }
-        super::helpers::explicit_shell_dispatch_command(&args[1], executable).ok()?;
         let resolved = resolved?;
+        resolve_runner_cwd(&resolved.config, cwd.as_deref()).ok()?;
         let runner = self
             .runner_registry
             .get_runner_view(&resolved.config.client_id)
             .await?;
-        let profiles = runner.policy.as_ref()?.shell_profiles.as_ref()?;
-        let entry = runner.projects.iter().find(|entry| {
-            super::runner_project_runtime_id(&runner.client_id, &entry.id) == resolved.resolved_id
-        })?;
-        let selected_profile = entry
-            .shell_profile
-            .as_deref()
-            .or(profiles.default_profile.as_deref());
-        let dialect = match selected_profile {
-            Some(name) => profiles
-                .profiles
-                .iter()
-                .find(|profile| profile.name == name)?
-                .dialect
-                .as_deref(),
-            None => profiles.default_dialect.as_deref(),
-        };
-        if !matches!(dialect, Some("sh" | "bash")) {
+        if !runner.capabilities.explicit_shell_selection {
             return None;
         }
-        let mut arguments = json!({"project": project, "shell": executable, "command": args[1]});
+        if login && !runner.capabilities.bash_login_shell {
+            return None;
+        }
+        let policy = runner.policy.as_ref()?;
+        if !policy.allow_raw_shell {
+            return None;
+        }
+        let available = policy
+            .shell_profiles
+            .as_ref()?
+            .available_dialects
+            .as_ref()?;
+        if !available.iter().any(|dialect| dialect == executable) {
+            return None;
+        }
+        let mut arguments =
+            json!({"project": project, "shell": executable, "login": login, "command": args[1]});
         for (name, value) in [
             ("session_id", json!(session_id)),
             ("cwd", json!(cwd)),
@@ -412,7 +413,7 @@ impl ToolRuntime {
         }
         // Use the real canonical parser, including wrapper-field validation.
         super::ToolCall::from_tool_name("run_shell", arguments.clone()).ok()?;
-        Some(super::SuggestedToolCall::new("run_shell", arguments).to_value())
+        Some(super::SuggestedToolCall::mechanically_followable("run_shell", arguments).to_value())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -611,6 +612,7 @@ impl ToolRuntime {
             .runner_registry
             .start_job_with_metadata_for_access(
                 ShellJobOpRequest {
+                    login: false,
                     op: "start".to_string(),
                     client_id: Some(client_id),
                     cwd: Some(effective_cwd),
@@ -916,6 +918,7 @@ impl ToolRuntime {
                 .runner_registry
                 .start_job_with_metadata_for_access(
                     ShellJobOpRequest {
+                        login: false,
                         op: "start".to_string(),
                         client_id: Some(client_id),
                         cwd: Some(effective_cwd),

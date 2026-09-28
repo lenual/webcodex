@@ -203,6 +203,11 @@ fn build_projects_router(
     db: Arc<crate::Database>,
     runtime: Arc<ToolRuntime>,
 ) -> Router {
+    #[cfg(feature = "legacy-gpt-actions")]
+    let legacy_gpt_action_router = Router::with_path("actions/{tool_name}").post(gpt_action_invoke);
+    #[cfg(not(feature = "legacy-gpt-actions"))]
+    let legacy_gpt_action_router = Router::new();
+
     Router::new()
         .hoop(affix_state::inject(config))
         .hoop(affix_state::inject(db))
@@ -212,7 +217,7 @@ fn build_projects_router(
                 .hoop(crate::AuthMiddleware)
                 .push(Router::with_path("tools/list").post(tools_list))
                 .push(Router::with_path("tools/call").post(tools_call))
-                .push(Router::with_path("actions/{tool_name}").post(gpt_action_invoke))
+                .push(legacy_gpt_action_router)
                 .push(
                     Router::with_path("artifacts/import")
                         .post(import_conversation_files_to_project),
@@ -260,6 +265,7 @@ async fn register_import_agent_with_capabilities(
     registry
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
+                computer_session_availability: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -500,20 +506,20 @@ async fn http_runtime_status_correct_bearer_returns_summary() {
     let out = &body["output"];
     assert_eq!(out["service"], "webcodex");
     assert_eq!(out["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(out["projects"]["mode"], "agent_registered");
+    assert_eq!(out["projects"]["mode"], "runner_registered");
     assert!(out["projects"].get("configured").is_none());
     assert!(out["projects"].get("server_static").is_none());
     assert_eq!(out["projects"]["count"], 1);
-    assert_eq!(out["projects"]["agent_registered"]["count"], 1);
-    assert_eq!(out["projects"]["agent_registered"]["online_count"], 1);
+    assert_eq!(out["projects"]["runner_registered"]["count"], 1);
+    assert_eq!(out["projects"]["runner_registered"]["online_count"], 1);
     assert_eq!(out["projects"]["effective"]["count"], 1);
     assert_eq!(out["projects"]["effective"]["status"], "ok");
-    assert!(out["agents"]["count"].is_i64());
+    assert!(out["runners"]["count"].is_i64());
     assert!(out["jobs"]["active_count"].is_i64());
     assert!(out["jobs"]["running_count"].is_i64());
     assert!(out["jobs"]["queued_count"].is_i64());
     assert_eq!(
-        out["agents"]["clients"][0]["job_concurrency"],
+        out["runners"]["clients"][0]["job_concurrency"],
         json!({"limit": null, "running": 0, "queued": 0})
     );
     assert!(out["tools"]["count"].is_i64());
@@ -588,11 +594,15 @@ fn http_runtime_status_after_runner_registration_fits_default_worker_stack() {
             .expect("realistic current Runner policy fixture");
             let mut registration =
                 crate::test_support::current_runner_registration(RunnerRegisterRequest {
+                    computer_session_availability: None,
                     process_started_at: Some(1),
                     build: Some(RunnerBuildInfo {
                         version: Some(env!("CARGO_PKG_VERSION").to_string()),
                         git_commit: Some("0123456789abcdef".to_string()),
                         git_dirty: Some(false),
+                        built_at: Some("100".to_string()),
+                        target: Some("x86_64-unknown-linux-gnu".to_string()),
+                        architecture: Some("x86_64".to_string()),
                     }),
                     job_concurrency_limit: Some(4),
                     job_inventory: Some(ShellJobInventory {
@@ -658,10 +668,22 @@ fn http_runtime_status_after_runner_registration_fits_default_worker_stack() {
             assert_eq!(effective_status(&status), StatusCode::OK);
             let body: Value = status.take_json().await.unwrap();
             assert_eq!(body["success"], true);
-            assert_eq!(body["output"]["agents"]["count"], 1);
+            assert_eq!(body["output"]["runners"]["count"], 1);
             assert_eq!(
-                body["output"]["agents"]["clients"][0]["client_id"],
+                body["output"]["runners"]["clients"][0]["client_id"],
                 "status-stack-runner"
+            );
+            assert_eq!(
+                body["output"]["runners"]["clients"][0]["build"]["built_at"],
+                "100"
+            );
+            assert_eq!(
+                body["output"]["runners"]["clients"][0]["build"]["target"],
+                "x86_64-unknown-linux-gnu"
+            );
+            assert_eq!(
+                body["output"]["runners"]["clients"][0]["build"]["architecture"],
+                "x86_64"
             );
         })
         .await
@@ -698,7 +720,7 @@ async fn http_runtime_status_optional_body_accepts_empty_and_rejects_malformed_j
 }
 
 // =========================================================================
-// Legacy /api/tools/call generic entry point
+// Generic /api/tools/call entry point
 // =========================================================================
 
 fn phase2_service() -> (tempfile::TempDir, salvo::Service) {
@@ -851,11 +873,10 @@ async fn http_tools_call_full_trace_captures_pre_dispatch_error_response() {
 }
 
 #[tokio::test]
-async fn flattened_tool_manifest_audit_intent_survives_null_params_wrapper() {
+async fn tool_manifest_audit_intent_uses_explicit_params() {
     let (tool, params) = extract_tool_call(&json!({
         "tool": "tool_manifest",
-        "params": null,
-        "intent": "audit",
+        "params": {"intent": "audit"},
     }))
     .unwrap();
     let call = ToolCall::from_tool_name(&tool, params).unwrap();
@@ -876,13 +897,14 @@ async fn flattened_tool_manifest_audit_intent_survives_null_params_wrapper() {
 }
 
 #[tokio::test]
-async fn flattened_tool_manifest_exact_name_survives_null_params_wrapper() {
+async fn tool_manifest_exact_name_uses_explicit_params() {
     let (tool, params) = extract_tool_call(&json!({
         "tool": "tool_manifest",
-        "params": null,
-        "tool_name": "cargo_test",
-        "include_recommended_flows": false,
-        "include_risk_summary": false,
+        "params": {
+            "tool_name": "cargo_test",
+            "include_recommended_flows": false,
+            "include_risk_summary": false
+        },
     }))
     .unwrap();
     let call = ToolCall::from_tool_name(&tool, params).unwrap();
@@ -899,25 +921,13 @@ async fn flattened_tool_manifest_exact_name_survives_null_params_wrapper() {
 }
 
 #[tokio::test]
-async fn http_start_coding_task_flattened_legacy_params_do_not_revive_unknown_tool() {
-    let config = test_config(Some("secret"));
-    let (_tmp, db) = test_db();
-    let tmp_proj = tempfile::tempdir().unwrap();
-    let (runtime, _registry) = register_import_agent(tmp_proj.path()).await;
-    let service = Service::new(build_projects_router(config, db, runtime));
-
+async fn http_tools_call_rejects_flattened_arguments_with_migration_guidance() {
+    let (_tmp, service) = phase2_service();
     let mut resp = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
         .json(&json!({
-            "tool": "start_coding_task",
-            "params": null,
-            "project": "agent:importer:demo",
-            "include_runtime_status": false,
-            "include_git": false,
-            "include_recent_commits": false,
-            "include_rules": false,
-            "include_tool_manifest": true,
-            "tool_manifest_intent": "audit",
+            "tool": "git_status",
+            "project": "agent:importer:demo"
         }))
         .send(&service)
         .await;
@@ -926,7 +936,9 @@ async fn http_start_coding_task_flattened_legacy_params_do_not_revive_unknown_to
     let body: Value = resp.take_json().await.unwrap();
     assert_eq!(body["status"], 400);
     let error = body["error"].as_str().unwrap_or_default();
-    assert!(error.contains("unknown tool 'start_coding_task'"), "{body}");
+    assert!(error.contains("unexpected top-level field"), "{body}");
+    assert!(error.contains("'project'"), "{body}");
+    assert!(error.contains("'params'"), "{body}");
 }
 
 // =========================================================================
@@ -954,16 +966,21 @@ async fn http_start_coding_task_uses_ordinary_unknown_tool_path() {
 }
 
 #[test]
-fn extract_tool_call_params_precede_flattened_fields() {
-    let (tool, params) = extract_tool_call(&json!({
-        "tool": "git_status",
-        "project": "wrong",
-        "params": {"project": "right"},
-    }))
-    .unwrap();
+fn extract_tool_call_rejects_unexpected_top_level_fields_even_with_params() {
+    for params in [Value::Null, json!({"project": "right"})] {
+        let error = extract_tool_call(&json!({
+            "tool": "git_status",
+            "project": "wrong",
+            "params": params,
+        }))
+        .unwrap_err();
 
-    assert_eq!(tool, "git_status");
-    assert_eq!(params, json!({"project": "right"}));
+        assert!(error.contains("unexpected top-level field"));
+        assert!(error.contains("'project'"));
+        assert!(error.contains("'params'"));
+        assert!(!error.contains("wrong"));
+        assert!(!error.contains("right"));
+    }
 }
 
 #[test]
@@ -1040,7 +1057,6 @@ fn extract_tool_call_rejects_retired_arguments_envelope() {
     for arguments in [json!(null), json!({"project": "right"})] {
         let error = extract_tool_call(&json!({
             "tool": "git_status",
-            "project": "flattened",
             "arguments": arguments,
         }))
         .unwrap_err();
@@ -1051,14 +1067,16 @@ fn extract_tool_call_rejects_retired_arguments_envelope() {
 }
 
 #[test]
-fn extract_tool_call_collects_flattened_top_level_fields() {
-    let (tool, params) = extract_tool_call(&json!({
+fn extract_tool_call_keeps_recording_session_id_out_of_explicit_params() {
+    let body = json!({
         "tool": "git_status",
-        "project": "agent:oe:webcodex",
-        "session_id": "wc_sess_tool_arg",
+        "params": {
+            "project": "agent:oe:webcodex",
+            "session_id": "wc_sess_tool_arg"
+        },
         TOOL_CALL_RECORDING_SESSION_ID_FIELD: "wc_sess_recorder",
-    }))
-    .unwrap();
+    });
+    let (tool, params) = extract_tool_call(&body).unwrap();
 
     assert_eq!(tool, "git_status");
     assert_eq!(
@@ -1066,23 +1084,23 @@ fn extract_tool_call_collects_flattened_top_level_fields() {
         json!({"project": "agent:oe:webcodex", "session_id": "wc_sess_tool_arg"})
     );
     assert_eq!(
-        extract_recording_session_id(
-            &json!({TOOL_CALL_RECORDING_SESSION_ID_FIELD: "wc_sess_recorder"})
-        ),
+        extract_recording_session_id(&body),
         Some("wc_sess_recorder".to_string())
     );
 }
 
 #[test]
-fn extract_tool_call_collects_flattened_session_handoff_flags() {
+fn extract_tool_call_accepts_explicit_session_handoff_params() {
     let body = json!({
         "tool": "session_handoff_summary",
-        "project": "agent:special:test-mcp",
-        "session_id": "wc_sess_test",
-        "include_validation": true,
-        "include_workspace": true,
-        "include_checkpoints": true,
-        "limit": 20,
+        "params": {
+            "project": "agent:special:test-mcp",
+            "session_id": "wc_sess_test",
+            "include_validation": true,
+            "include_workspace": true,
+            "include_checkpoints": true,
+            "limit": 20
+        },
         TOOL_CALL_RECORDING_SESSION_ID_FIELD: "wc_sess_recorder"
     });
     let (tool, params) = extract_tool_call(&body).unwrap();
@@ -1112,13 +1130,15 @@ fn extract_tool_call_collects_flattened_session_handoff_flags() {
 }
 
 #[test]
-fn extract_tool_call_collects_flattened_write_project_file_fields() {
+fn extract_tool_call_accepts_explicit_write_project_file_params() {
     let (tool, params) = extract_tool_call(&json!({
         "tool": "write_project_file",
-        "project": "agent:oe:webcodex",
-        "path": "x.tmp",
-        "content": "BETA\n",
-        "overwrite": true,
+        "params": {
+            "project": "agent:oe:webcodex",
+            "path": "x.tmp",
+            "content": "BETA\n",
+            "overwrite": true
+        },
     }))
     .unwrap();
 
@@ -1131,16 +1151,14 @@ fn extract_tool_call_collects_flattened_write_project_file_fields() {
 
 #[test]
 #[cfg(feature = "workspace-checkpoints")]
-fn extract_tool_call_collects_flattened_checkpoint_restore_fields() {
-    // GPT Action flattened call for workspace_checkpoint_restore: the
-    // recorder metadata (recording_session_id) must be stripped from
-    // params while the business fields (project/checkpoint_id/confirm)
-    // are collected into params for concrete dispatch.
+fn extract_tool_call_accepts_explicit_checkpoint_restore_params() {
     let body = json!({
         "tool": "workspace_checkpoint_restore",
-        "project": "agent:special:test",
-        "checkpoint_id": "wc_ckpt_abc",
-        "confirm": true,
+        "params": {
+            "project": "agent:special:test",
+            "checkpoint_id": "wc_ckpt_abc",
+            "confirm": true
+        },
         TOOL_CALL_RECORDING_SESSION_ID_FIELD: "wc_sess_record"
     });
     let (tool, params) = extract_tool_call(&body).unwrap();
@@ -1163,23 +1181,23 @@ fn extract_tool_call_collects_flattened_checkpoint_restore_fields() {
 }
 
 #[test]
-fn extract_tool_call_collects_flattened_apply_text_edits_fields() {
-    // GPT Action flattened call for apply_text_edits: nested `changes`
-    // array and scalar flattened fields must be collected into params.
+fn extract_tool_call_accepts_explicit_apply_text_edits_params() {
     let (tool, params) = extract_tool_call(&json!({
-        "tool": "apply_text_edits",
-        "project": "agent:special:test",
-        "dry_run": true,
-        "changes": [{
-            "kind": "edit",
-            "path": "a.txt",
-            "expected_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "edits": [{"kind": "replace_exact", "old_text": "a", "new_text": "b"}]
-        }]
+        "tool": "edit_project_files",
+        "params": {
+            "project": "agent:special:test",
+            "dry_run": true,
+            "changes": [{
+                "kind": "edit",
+                "path": "a.txt",
+                "expected_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "edits": [{"kind": "replace_exact", "old_text": "a", "new_text": "b"}]
+            }]
+        }
     }))
     .unwrap();
 
-    assert_eq!(tool, "apply_text_edits");
+    assert_eq!(tool, "edit_project_files");
     assert_eq!(params["project"], "agent:special:test");
     assert_eq!(params["dry_run"], true);
     let changes = params["changes"].as_array().unwrap();
@@ -1321,6 +1339,18 @@ async fn http_tools_call_rejects_malformed_and_unknown_request_matrix() {
             false,
         ),
         (
+            "missing params for argumented tool",
+            json!({"tool": "git_status"}),
+            vec!["git_status", "project"],
+            false,
+        ),
+        (
+            "null params for argumented tool",
+            json!({"tool": "git_status", "params": null}),
+            vec!["git_status", "project"],
+            false,
+        ),
+        (
             "missing outer tool",
             json!({"params": {}}),
             vec!["tool"],
@@ -1380,8 +1410,10 @@ async fn start_session_returns_session_id() {
         .bearer_auth("secret")
         .json(&json!({
             "tool": "start_session",
-            "project": "demo",
-            "title": "implement show_changes follow-up"
+            "params": {
+                "project": "demo",
+                "title": "implement show_changes follow-up"
+            }
         }))
         .send(&service)
         .await;
@@ -1414,8 +1446,10 @@ async fn session_summary_empty_session() {
         .bearer_auth("secret")
         .json(&json!({
             "tool": "session_summary",
-            "session_id": session_id,
-            "limit": 50
+            "params": {
+                "session_id": session_id,
+                "limit": 50
+            }
         }))
         .send(&service)
         .await;
@@ -1517,11 +1551,13 @@ async fn api_tools_call_accepts_hidden_testing_metadata_and_records_expectation(
         .bearer_auth("secret")
         .json(&json!({
             "tool": "job_status",
-            TOOL_CALL_RECORDING_SESSION_ID_FIELD: session_id,
-            "job_id": "missing-job",
-            "expected_failure": true,
-            "expected_failure_kind": "invalid_arguments",
-            "assertion_name": "api hidden metadata compatibility"
+            "params": {
+                "job_id": "missing-job",
+                "expected_failure": true,
+                "expected_failure_kind": "invalid_arguments",
+                "assertion_name": "api hidden metadata compatibility"
+            },
+            TOOL_CALL_RECORDING_SESSION_ID_FIELD: session_id
         }))
         .send(&service)
         .await;
@@ -1550,11 +1586,81 @@ async fn api_tools_call_accepts_hidden_testing_metadata_and_records_expectation(
 }
 
 #[tokio::test]
+async fn api_hidden_handoff_state_reads_exact_session_without_recording_it() {
+    let config = test_config(Some("secret"));
+    let (_db_tmp, db) = test_db();
+    let project_tmp = tempfile::tempdir().unwrap();
+    std::fs::write(project_tmp.path().join("README.md"), "hello\n").unwrap();
+    let (runtime, registry) = register_import_agent_with_capabilities(
+        project_tmp.path(),
+        Some(crate::runner_protocol::RunnerCapabilities {
+            shell: true,
+            git: true,
+            ..Default::default()
+        }),
+    )
+    .await;
+    let executor = spawn_startup_agent_executor(registry);
+    let service = Service::new(build_projects_router(config, db, runtime.clone()));
+    let project = "agent:importer:demo";
+
+    let mut resp = TestClient::post("http://localhost/api/tools/call")
+        .bearer_auth("secret")
+        .json(&json!({
+            "tool": "start_session",
+            "params": {"project": project, "title": "local handoff target"}
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(effective_status(&resp), StatusCode::OK);
+    let start_body: Value = resp.take_json().await.unwrap();
+    let session_id = start_body["output"]["session_id"]
+        .as_str()
+        .expect("start_session id")
+        .to_string();
+    let before = runtime
+        .sessions
+        .summary(&session_id, None)
+        .expect("business Session before hidden handoff read");
+
+    let mut resp = TestClient::post("http://localhost/api/tools/call")
+        .bearer_auth("secret")
+        .json(&json!({
+            "tool": "session_handoff_state",
+            "params": {"project": project, "session_id": session_id}
+        }))
+        .send(&service)
+        .await;
+    let status = effective_status(&resp);
+    let body: Value = resp.take_json().await.unwrap();
+    executor.abort();
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["success"], true, "{body}");
+    assert_eq!(body["output"]["project"], project);
+    assert_eq!(body["output"]["session_id"], session_id);
+    assert_eq!(
+        body["output"]["handoff_brief"]["session"]["session_id"],
+        session_id
+    );
+    assert_eq!(
+        body["output"]["handoff_brief"]["external_observations"]["provenance"],
+        "external_report"
+    );
+    let after = runtime
+        .sessions
+        .summary(&session_id, None)
+        .expect("business Session after hidden handoff read");
+    assert_eq!(after.events_total, before.events_total);
+    assert_eq!(after.updated_at, before.updated_at);
+}
+
+#[tokio::test]
 async fn api_tools_call_uses_recording_session_id_for_recorder_metadata() {
     let (_tmp, service) = phase2_service();
     let mut resp = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
-        .json(&json!({"tool": "start_session", "title": "tracking"}))
+        .json(&json!({"tool": "start_session", "params": {"title": "tracking"}}))
         .send(&service)
         .await;
     let tracking_body: Value = resp.take_json().await.unwrap();
@@ -1562,7 +1668,7 @@ async fn api_tools_call_uses_recording_session_id_for_recorder_metadata() {
 
     let mut resp = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
-        .json(&json!({"tool": "start_session", "title": "business"}))
+        .json(&json!({"tool": "start_session", "params": {"title": "business"}}))
         .send(&service)
         .await;
     let business_body: Value = resp.take_json().await.unwrap();
@@ -1572,7 +1678,7 @@ async fn api_tools_call_uses_recording_session_id_for_recorder_metadata() {
         .bearer_auth("secret")
         .json(&json!({
             "tool": "session_summary",
-            "session_id": business_session_id,
+            "params": {"session_id": business_session_id},
             TOOL_CALL_RECORDING_SESSION_ID_FIELD: tracking_session_id
         }))
         .send(&service)
@@ -1591,7 +1697,7 @@ async fn api_tools_call_uses_recording_session_id_for_recorder_metadata() {
         .bearer_auth("secret")
         .json(&json!({
             "tool": "session_summary",
-            "session_id": tracking_session_id
+            "params": {"session_id": tracking_session_id}
         }))
         .send(&service)
         .await;
@@ -1619,7 +1725,7 @@ async fn api_tools_call_message_tool_keeps_business_session_id_with_recording_se
     let (_tmp, service) = phase2_service();
     let mut resp = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
-        .json(&json!({"tool": "start_session", "title": "tracking"}))
+        .json(&json!({"tool": "start_session", "params": {"title": "tracking"}}))
         .send(&service)
         .await;
     let tracking_body: Value = resp.take_json().await.unwrap();
@@ -1627,7 +1733,7 @@ async fn api_tools_call_message_tool_keeps_business_session_id_with_recording_se
 
     let mut resp = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
-        .json(&json!({"tool": "start_session", "title": "business"}))
+        .json(&json!({"tool": "start_session", "params": {"title": "business"}}))
         .send(&service)
         .await;
     let business_body: Value = resp.take_json().await.unwrap();
@@ -1637,12 +1743,14 @@ async fn api_tools_call_message_tool_keeps_business_session_id_with_recording_se
         .bearer_auth("secret")
         .json(&json!({
             "tool": "post_session_message",
-            "session_id": business_session_id,
-            TOOL_CALL_RECORDING_SESSION_ID_FIELD: tracking_session_id,
-            "kind": "guidance",
-            "message": "Keep this behind call_runtime_tool.",
-            "tags": ["openapi", "constraint"],
-            "priority": "normal"
+            "params": {
+                "session_id": business_session_id,
+                "kind": "guidance",
+                "message": "Keep this behind call_runtime_tool.",
+                "tags": ["openapi", "constraint"],
+                "priority": "normal"
+            },
+            TOOL_CALL_RECORDING_SESSION_ID_FIELD: tracking_session_id
         }))
         .send(&service)
         .await;
@@ -1659,8 +1767,10 @@ async fn api_tools_call_message_tool_keeps_business_session_id_with_recording_se
         .bearer_auth("secret")
         .json(&json!({
             "tool": "list_session_messages",
-            "session_id": business_session_id,
-            "kind": "guidance"
+            "params": {
+                "session_id": business_session_id,
+                "kind": "guidance"
+            }
         }))
         .send(&service)
         .await;
@@ -1682,7 +1792,7 @@ async fn api_tools_call_message_tool_keeps_business_session_id_with_recording_se
         .bearer_auth("secret")
         .json(&json!({
             "tool": "session_summary",
-            "session_id": tracking_session_id
+            "params": {"session_id": tracking_session_id}
         }))
         .send(&service)
         .await;
@@ -1705,8 +1815,10 @@ async fn read_only_session_allows_post_session_message_metadata() {
         .bearer_auth("secret")
         .json(&json!({
             "tool": "start_session",
-            "title": "readonly message board",
-            "mode": "read_only"
+            "params": {
+                "title": "readonly message board",
+                "mode": "read_only"
+            }
         }))
         .send(&service)
         .await;
@@ -1718,9 +1830,11 @@ async fn read_only_session_allows_post_session_message_metadata() {
         .bearer_auth("secret")
         .json(&json!({
             "tool": "post_session_message",
-            "session_id": session_id,
-            "kind": "progress",
-            "message": "Read-only sessions may still record collaboration metadata."
+            "params": {
+                "session_id": session_id,
+                "kind": "progress",
+                "message": "Read-only sessions may still record collaboration metadata."
+            }
         }))
         .send(&service)
         .await;
@@ -1731,7 +1845,7 @@ async fn read_only_session_allows_post_session_message_metadata() {
 
     let mut resp = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
-        .json(&json!({"tool": "session_summary", "session_id": session_id}))
+        .json(&json!({"tool": "session_summary", "params": {"session_id": session_id}}))
         .send(&service)
         .await;
     assert_eq!(effective_status(&resp), StatusCode::OK);
@@ -1800,23 +1914,33 @@ async fn http_tools_call_rejects_arguments_even_when_params_are_present() {
 }
 
 #[tokio::test]
-async fn http_tools_call_rejects_app_only_work_result_state() {
+async fn http_tools_call_rejects_app_only_work_result_operations() {
     let (_tmp, service) = phase2_service();
-    let (status, body) = http_tool_call(
-        &service,
-        json!({
-            "tool": "work_result_state",
-            "params": {
+    for (tool, params) in [
+        (
+            "work_result_state",
+            json!({
                 "project": "agent:canonical:p",
                 "session_id": format!("wc_sess_{}", "1".repeat(32))
-            }
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(body["error"]
-        .as_str()
-        .is_some_and(|error| error.contains("Work Result App state")));
+            }),
+        ),
+        (
+            "work_result_send_message",
+            json!({
+                "project": "agent:canonical:p",
+                "session_id": format!("wc_sess_{}", "1".repeat(32)),
+                "message": "hello",
+                "delivery_key": "http-must-not-call-app-tool"
+            }),
+        ),
+    ] {
+        let (status, body) =
+            http_tool_call(&service, json!({"tool": tool, "params": params})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{tool}: {body}");
+        assert!(body["error"].as_str().is_some_and(|error| {
+            error.contains("Work Result App") && error.contains("Stateless MCP 2026")
+        }));
+    }
 }
 
 #[tokio::test]
@@ -1975,6 +2099,7 @@ async fn oauth_tools_call(
     (status, body, challenge)
 }
 
+#[cfg(feature = "legacy-gpt-actions")]
 async fn oauth_action_call(
     service: &Service,
     token: &str,
@@ -2250,6 +2375,7 @@ async fn oauth2_tools_call_unknown_tool_fails_closed() {
     assert_oauth_scope_rejected(status, &body, challenge.as_deref(), None);
 }
 
+#[cfg(feature = "legacy-gpt-actions")]
 #[tokio::test]
 async fn gpt_action_direct_and_gateway_admission_fail_closed() {
     let (_tmp, service) = phase2_service();
@@ -2353,6 +2479,7 @@ async fn gpt_action_direct_and_gateway_admission_fail_closed() {
     }
 }
 
+#[cfg(feature = "legacy-gpt-actions")]
 #[tokio::test]
 async fn gpt_action_suggested_call_projection_preserves_canonical_generic_result() {
     let (_tmp, service) = phase2_service();
@@ -2409,6 +2536,7 @@ async fn gpt_action_suggested_call_projection_preserves_canonical_generic_result
     assert_eq!(recovery["success"], true, "{recovery}");
 }
 
+#[cfg(feature = "legacy-gpt-actions")]
 #[tokio::test]
 async fn oauth2_gpt_action_direct_scope_outcomes_match_mcp_direct_policy() {
     let (_tmp, service, token) = phase2_oauth_service("project:read");
@@ -2462,6 +2590,7 @@ async fn oauth2_gpt_action_direct_scope_outcomes_match_mcp_direct_policy() {
     );
 }
 
+#[cfg(feature = "legacy-gpt-actions")]
 #[tokio::test]
 async fn gpt_action_direct_cannot_bypass_project_owner_authority() {
     use crate::runner_protocol::{RunnerProjectSummary, RunnerRegisterRequest};
@@ -2477,6 +2606,7 @@ async fn gpt_action_direct_cannot_bypass_project_owner_authority() {
     registry
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
+                computer_session_availability: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -2544,6 +2674,7 @@ async fn gpt_action_direct_cannot_bypass_project_owner_authority() {
     assert!(!rendered.contains("alice"));
 }
 
+#[cfg(feature = "legacy-gpt-actions")]
 #[tokio::test]
 async fn gpt_action_direct_still_obeys_permission_gate() {
     use crate::tool_runtime::permissions::{AuthorityMode, PermissionEvaluator};
@@ -2578,6 +2709,7 @@ async fn gpt_action_direct_still_obeys_permission_gate() {
     );
 }
 
+#[cfg(feature = "legacy-gpt-actions")]
 #[tokio::test]
 async fn gpt_action_file_import_rewrites_host_shape_and_keeps_provenance_private() {
     let root = tempfile::tempdir().unwrap();
@@ -2649,10 +2781,15 @@ async fn http_tools_list_includes_phase4_edit_tools() {
     ] {
         assert!(!names.iter().any(|n| n == removed));
     }
-    assert!(names.iter().any(|n| n == "write_project_file"));
+    for hidden in webcodex_tool_contracts::EXACT_MANIFEST_SPECIALIST_TOOL_NAMES {
+        assert!(
+            !names.iter().any(|n| n == hidden),
+            "exact-manifest specialist leaked into ordinary tools/list: {hidden}"
+        );
+    }
     assert_eq!(body["count"], names.len());
     let tools = body["tools"].as_array().unwrap();
-    for name in ["read_files", "run_shell", "write_project_file"] {
+    for name in ["read_files", "run_shell", "edit_project_files"] {
         let tool = tools
             .iter()
             .find(|tool| tool["name"] == name)

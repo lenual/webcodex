@@ -10,6 +10,18 @@ For everyday use, run a regular Server + Runner. Follow the [Full Setup guide](P
 
 If you only want to try one repository temporarily, use the `share` path below.
 
+## ChatGPT host-side Developer MCP errors
+
+If ChatGPT reports:
+
+```text
+FORBIDDEN: This conversation does not support developer MCPs
+```
+
+The rejection comes from the ChatGPT host or the conversation-level Developer MCP admission and routing layer. It does not by itself mean that WebCodex permanently disabled developer access, that the Runner is offline, or that the project registration is invalid.
+
+Check the Runner and project state independently. If they remain available and the request did not reach WebCodex, retry in a conversation where ChatGPT admits Developer MCPs. No WebCodex configuration change is required solely because this host-side error appeared.
+
 ## ChatGPT: temporary `share`
 
 Explicit `share` is supported on Linux, macOS, and Windows and owns a temporary single-project environment for that foreground run. Windows x64 can use the managed default Cloudflare Quick Tunnel; Windows ARM64 needs a trusted explicit/PATH `cloudflared` because the pinned Cloudflare release publishes no official ARM64 artifact. Managed OpenAI `tunnel-client` supports both Windows x64 and arm64.
@@ -39,6 +51,13 @@ apps, and write/modify actions are controlled independently by the ChatGPT plan,
 workspace, and admin settings; those client-side permissions are not widened by
 WebCodex scopes.
 
+If ChatGPT itself reports `FORBIDDEN: This conversation does not support
+developer MCPs` (or says the current conversation disabled the developer MCP
+server), treat that as a Host/conversation admission problem until proven
+otherwise. If the Host refuses to dispatch `runtime_status`, that text is not a
+WebCodex tool result. Verify the Server/Runner independently before changing
+credentials or Runner configuration; see [Troubleshooting](TROUBLESHOOTING.md).
+
 ## Claude and other MCP clients
 
 Use the same printed `/mcp` URL and authentication values. In Claude, add a
@@ -59,12 +78,18 @@ Tunnel + No authentication; the temporary WebCodex Bearer stays local and is
 injected by the pinned verified OpenAI `tunnel-client`.
 
 For a long-lived **loopback-only** Server reached through OpenAI Secure Tunnel,
-operators may explicitly trust ChatGPT host-file rewrites authenticated by the
-local user API token by setting
-`WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT=true`. This exception works
-only when `WEBCODEX_ADDR` resolves to loopback and the authenticated credential
-is a normal user API token. It remains off by default and must not be used as a
-substitute for OAuth on a network-accessible Server.
+ChatGPT host-file rewrites authenticated by the explicitly allowed local tunnel
+credential can be trusted by setting
+`WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT=true`. Starting with v0.4.2,
+WebCodex Desktop writes this value by default for the local loopback Server it owns; an
+existing explicit value is never overwritten. The exception works only when
+`WEBCODEX_ADDR` resolves to loopback and the authenticated credential is either a
+normal user API token or the configured Server bootstrap credential used by the
+Desktop regular Tunnel. The regular Tunnel derives that credential from the local
+`WEBCODEX_TOKEN` configuration and injects it into its private tunnel-client
+authorization; users should not copy or expose that credential. Independent/network-
+accessible Servers remain off by default and must not use this as a substitute for
+OAuth.
 
 For a regular independent Windows Server + Runner reached through OpenAI Tunnel, or to troubleshoot a case where local `/readyz` is healthy but ChatGPT Connector creation still fails, see the [Windows + OpenAI Secure MCP Tunnel deep dive](WINDOWS_OPENAI_TUNNEL.md). It is advanced setup/troubleshooting material, not required reading for a first-time user.
 
@@ -85,6 +110,28 @@ invoke tools; the canonical tool result remains available independently.
 disabling the underlying tools.
 
 The current Result App is intentionally static. September 2026 Host experiments proved that a separately designed MCP App controller can poll server-owned state and request later ChatGPT model turns, including a bounded foreground autonomous multi-turn loop, but background-tab model-turn scheduling is not an immediate guarantee. Those findings and the production design constraints are recorded in [`agent/mcp-app-continuation-experiments.md`](agent/mcp-app-continuation-experiments.md); they do not change the current Result App contract.
+
+### Live Work Result card
+
+`present_work_result` opens the separate Window work card with Activity, Results,
+and Collaboration tabs. Results shows the current Project's uncommitted files,
+rename paths, staging state, and available line counts while work is in progress.
+The bounded workspace snapshot can include changes from other work; partial file
+lists and missing line counts are labelled. A clean workspace is not task success.
+Linked Session check/review evidence appears when available.
+
+After closeout, Results also shows the sealed final task changes with on-demand
+per-file diffs. Those diffs keep their original snapshot identity even if the live
+workspace changes. Refresh uses the existing App-only observation path; opening
+Results adds no tool calls. Automatic refresh pauses while the App document is
+hidden and uses a bounded visible cadence so background cards do not continuously
+exercise the Host tool bridge. Discuss these changes opens the existing composer
+without sending a message. Window activity calls are compact, collapsed by default,
+and fetch their sanitized trace/timing details only when expanded. The card header
+shows the canonical hashed Window key used by the Window activity ledger, making
+support traces attributable without exposing the Host's raw Window identifier.
+New cards use `ui://webcodex/work-result/v11` so Hosts with cached older templates
+load the updated activity presentation and lazy-detail contract.
 
 ## Existing Server
 
@@ -110,7 +157,7 @@ advanced identity flow.
 
 ### Adaptive Runtime routing
 
-There is one model-facing MCP runtime contract: **Adaptive Runtime**. Canonical `ToolDefinition` rank decides the direct tools; ordinary model-visible long-tail tools are invoked through `call_runtime_tool`; server-owned protocol capabilities and MCP App admission may add hidden extensions for the relevant protocol request. There is no startup model-surface selector. Direct versus gateway routing changes presentation only and never bypasses the target tool's authentication, Project authority, permission, Runner capability, Session, or safety checks.
+There is one model-facing MCP runtime contract: **Adaptive Runtime**. Canonical `ToolDefinition` rank decides the direct tools; ordinary model-visible long-tail tools are invoked through `call_runtime_tool`; server-owned protocol capabilities and MCP App admission may add hidden extensions for the relevant protocol request. There is no startup model-surface selector. `tool_manifest(tool_name=...)` is discovery only: it never dynamically registers a new Host tool. Its exact `route.primary` describes the preferred callable, and a normal direct tool also exposes `route.fallback` through `call_runtime_tool` for the case where that direct callable is not present; explicit MCP App presentation tools mark that fallback as blocked while Apps are enabled. Direct versus gateway routing changes presentation only and never bypasses the target tool's authentication, Project authority, permission, Runner capability, Session, or safety checks.
 
 ### Tool result framing
 
@@ -236,7 +283,8 @@ A typical coding flow is:
 ```text
 work_on_project
 → read_files / search_project_texts / semantic navigation as needed
-→ apply_text_edits or other canonical edit tools
+→ edit_project_files or other canonical edit tools
+→ present_work_result once when substantial work becomes materially stateful
 → run_process / run_shell / focused validation tools as needed
 → show_changes
 → finish_coding_task
@@ -244,13 +292,43 @@ work_on_project
 
 `work_on_project` starts or resumes an explicit Workflow Session on an ordinary registered Project. If the user requests isolation, `work_on_project(mode=worktree)` asks the Runner to create its canonical managed worktree and registers that worktree as another ordinary Project. Without that request, local `share`/`run` work directly on the one Project already registered by setup.
 
+`present_work_result` is a one-card presentation layer for substantial coding, not a correctness primitive. Once mounted, its App-only state reads keep current progress, workspace, validation, and review visible without model polling. A non-blocking `finish_coding_task` seals eligible final changes in the presentation cache at closeout; the same card then discovers that immutable snapshot and can lazily expand per-file diffs. Tiny/read-only work should skip the card; repeated presentation of the same Session should be avoided.
+
 Adaptive Runtime may expose common tools directly and long-tail tools through `call_runtime_tool`. Direct versus gateway exposure never changes schema validation, OAuth scope, Project authority, permission policy, Runner capability checks, Session fences, or effects.
 
 The removed ProjectConnector capability names (`task_start`, `files_read`, `edits_apply`, `task_finish`, and related operations) are not compatibility aliases for runtime tools. Use the current ToolRuntime names returned by `tools/list`/`tool_manifest`.
 
 ### Long work continues as Jobs
 
+`observe_jobs(summary_only=true)` is an opt-in presentation mode for proven successful
+structured validation Jobs. It removes routine passed-test and Cargo progress lines,
+while preserving test summaries, unknown text, warnings, validation evidence, lifecycle,
+and truncation/reset/retention flags. Failures, zero/unproven tests, compile-only test
+runs, incomplete validation evidence, and ordinary commands keep their normal output.
+Tiny results are unchanged when summary metadata would make them larger.
+
+A summarized item includes `logs_omitted` and a parser-ready `suggested_call` with
+`summary_only=false`. That call preserves the **original** observation cursor; using
+the newly returned observation token instead would skip omitted lines. Expansion is
+bounded by the existing log retention and may report reset or unavailable history.
+No log copy, model invocation, Job execution, permission, or waiting policy is added.
+Omitting `summary_only` preserves the existing behavior.
+
+`search_and_read` reuses ordinary search-result sparsification after read planning.
+It omits redundant phase metadata, not source text, query indexes, failure evidence,
+read revisions, or snapshot-bound continuations.
+
+
 Long-running commands and validations use the canonical WebCodex Job lifecycle. Observe the exact Job returned by the initiating call with `observe_jobs` (or recover it with `list_jobs` when identity was genuinely lost) instead of starting another copy. Jobs are not wrapped as MCP Tasks; WebCodex does not advertise the former Connector-specific MCP Tasks extension.
+
+The ChatGPT/model turn and one MCP observation request do not own the Job lifetime.
+A Host-side `Thinking stopped` / `Thinking failed`, request timeout, or dropped
+observation therefore does not by itself prove that the Job stopped. Resume the same
+conversation and re-observe the existing Job; recover Job inventory before any retry
+when identity was lost. Do not redispatch solely because the model turn ended.
+Eligible terminal waits may expose best-effort Host continuation, but Host acceptance
+does not guarantee that a new model turn actually ran. See
+[Troubleshooting](TROUBLESHOOTING.md#chatgpt-reports-thinking-stopped--thinking-failed-during-long-running-work).
 
 ## First safe prompt
 
@@ -310,18 +388,18 @@ and execution keep the direct `skill_load` and `run_skill_resource` paths.
 The optional closeout helpers `workspace_hygiene_check` and `finish_coding_task`
 are model-visible gateway tools; review/coding catalogs still recommend them.
 
+Stateless MCP 2026 exposes common untrusted invocation metadata only through one optional closed `_wc` envelope. Depending on the tool, the envelope may admit `record`, `ack`, `ack_ref`, `resolve`, `reply`, `context`, and `control`. These are adapter metadata only: they never become canonical ToolCall business arguments or grant authority. Legacy flat root wrappers such as `recording_session_id`, `ack_session_message_ids`, `ack_ref`, `session_message_resolution`, `window_reply`, `context_request`, and `_control` are rejected on this Stateless 2026 surface; legacy/non-stateless transports keep their existing contracts. `call_runtime_tool` carries `_wc` only on the outer gateway call; the nested target `arguments` remain canonical business arguments and reject a second `_wc`.
+
 `WEBCODEX_MCP_COMPACT_SCHEMAS` defaults to `true`. Compact `tools/list` omits
 `outputSchema` and projects shorter MCP-specific tool/input descriptions for
 selection: purpose, nearby tool distinctions, and essential continuation guidance.
-Repeated Session/context wrapper and audited common-argument copy is shortened
-too. Compact discovery omits only the exact opaque-ID regexes on
-`recording_session_id`, `ack_session_message_ids.items`, and
-`session_message_resolution.message_id`; their existing parent descriptions keep
-the `wc_sess_*` / `wc_msg_*` type hints. Copy the exact returned IDs.
-Business-ID, hash/Git fence and resource-path patterns, all bounds, field names,
-required fields, enums, object/union shape, annotations, and MCP App/file metadata
-are preserved. This is discovery presentation only; runtime argument validation
-and execution authority do not change.
+Repeated `_wc` copy is shortened too. Compact discovery preserves the envelope
+shape and bounds while omitting only repeated prose and exact opaque-ID regexes on
+`_wc.record`, `_wc.ack.items`, and `_wc.resolve.message_id`; the full manifest
+retains the complete contracts. Business-ID, hash/Git fence and resource-path
+patterns, all bounds, required fields, enums, object/union shape, annotations, and
+MCP App/file metadata are preserved. This is discovery presentation only; runtime
+argument validation and execution authority do not change.
 
 Use `tool_manifest(tool_name=...)` for the full exact input contract and operational
 description, or set compact schemas to `false` for full discovery schemas.

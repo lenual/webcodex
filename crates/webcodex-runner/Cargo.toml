@@ -15,6 +15,7 @@ webcodex-browser = { path = "../webcodex-browser" }
 webcodex-computer = { path = "../webcodex-computer" }
 webcodex-runner-config = { path = "../webcodex-runner-config" }
 webcodex-core = { path = "../webcodex-core" }
+webcodex-environment = { path = "../webcodex-environment" }
 webcodex-lsp = { path = "../webcodex-lsp" }
 webcodex-persistent-shell = { path = "../webcodex-persistent-shell" }
 webcodex-process = { path = "../webcodex-process" }
@@ -51,6 +52,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Globalization",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
 
@@ -59,5 +61,7 @@ windows-sys = { version = "0.61.2", features = [
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }

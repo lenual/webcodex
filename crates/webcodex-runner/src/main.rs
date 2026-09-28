@@ -67,7 +67,7 @@ use webcodex_runner::{
 use webcodex_runner::{
     client_profile_runner_config, configured_validation_job_command, default_config_path,
     dispatch_request_with_outcome, err_cmd, handle_apply_patch_file_request,
-    handle_apply_text_edits_file_request, handle_artifact_file_operation,
+    handle_apply_text_edits_file_request, handle_artifact_file_operation_with_store,
     handle_basic_file_request, handle_write_project_file_request, hostname, load_config,
     max_concurrent_jobs, ok_cmd, project_registry_dir, resolve_requested_path, run_runner,
     validate_client_profile, validate_structured_edit_runner_path, CommandResult, HotRunnerConfig,
@@ -106,6 +106,10 @@ enum RunnerCliAction {
         config_path: PathBuf,
         once: bool,
         stop_on_stdin_eof: bool,
+        computer_session_dir: Option<PathBuf>,
+    },
+    ComputerSessionHelper {
+        session_state_dir: PathBuf,
     },
     Exit {
         code: i32,
@@ -115,7 +119,7 @@ enum RunnerCliAction {
 }
 
 fn usage() -> &'static str {
-    "Usage: webcodex-runner [--config PATH] [--once] [--stop-on-stdin-eof]\n\n\
+    "Usage: webcodex-runner [--config PATH] [--once] [--stop-on-stdin-eof] [--computer-session-dir PATH]\n\n\
      Options:\n\
        -h, --help                 Print help and exit\n\
        -V, --version              Print version and exit\n\
@@ -123,13 +127,14 @@ fn usage() -> &'static str {
        --profile NAME             Client config profile for default config path\n\
        --once                     Complete one successful poll, then exit (polling transport)\n\
        --stop-on-stdin-eof        Stop when the invoking parent closes stdin\n\n\
+       --computer-session-dir PATH  Route Computer calls to login-session helper\n\
+       --computer-session-helper --session-state-dir PATH  Run login-session helper\n\n\
      With --profile, the default config path is derived under\n\
      /etc/webcodex/clients/<profile> for root or\n\
      ~/.config/webcodex/clients/<profile> for non-root users. Explicit\n\
      --config overrides the profile-derived default.\n\n\
      Environment:\n\
        WEBCODEX_RUNNER_CONFIG     default config path override\n\
-       WEBCODEX_AGENT_CONFIG      legacy alias for WEBCODEX_RUNNER_CONFIG\n\
      Example runner.toml:\n\
        server_url = \"https://v4.yyjeqhc.cn\"\n\
        token = \"...\"\n\
@@ -150,6 +155,19 @@ fn parse_args() -> Result<RunnerCliAction, String> {
     parse_runner_args(std::env::args().skip(1))
 }
 
+#[cfg(windows)]
+fn parse_service_runner_args(args: &[String]) -> Result<(PathBuf, PathBuf), String> {
+    if args.len() != 4
+        || args[0] != "--config"
+        || args[2] != "--computer-session-dir"
+        || args[1].is_empty()
+        || args[3].is_empty()
+    {
+        return Err("Runner service requires --config PATH --computer-session-dir PATH".into());
+    }
+    Ok((PathBuf::from(&args[1]), PathBuf::from(&args[3])))
+}
+
 fn parse_runner_args<I, S>(args: I) -> Result<RunnerCliAction, String>
 where
     I: IntoIterator<Item = S>,
@@ -159,8 +177,28 @@ where
         .into_iter()
         .map(|arg| arg.as_ref().to_string())
         .collect();
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--computer-session-helper")
+    {
+        if args.len() != 3 || args[1] != "--session-state-dir" || args[2].is_empty() {
+            return Err(
+                "computer session helper requires only --session-state-dir PATH".to_string(),
+            );
+        }
+        return Ok(RunnerCliAction::ComputerSessionHelper {
+            session_state_dir: PathBuf::from(&args[2]),
+        });
+    }
     if args.len() == 1 {
         match args[0].as_str() {
+            "--build-info-json" => {
+                return Ok(RunnerCliAction::Exit {
+                    code: 0,
+                    stdout: build_info::build_info_json("webcodex-runner"),
+                    stderr: String::new(),
+                });
+            }
             "--help" | "-h" => {
                 return Ok(RunnerCliAction::Exit {
                     code: 0,
@@ -184,6 +222,7 @@ where
     let mut profile: Option<String> = None;
     let mut once = false;
     let mut stop_on_stdin_eof = false;
+    let mut computer_session_dir = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -203,6 +242,12 @@ where
             }
             "--once" => once = true,
             "--stop-on-stdin-eof" => stop_on_stdin_eof = true,
+            "--computer-session-dir" => {
+                let Some(path) = args.next() else {
+                    return Err("--computer-session-dir requires a path".to_string());
+                };
+                computer_session_dir = Some(PathBuf::from(path));
+            }
             "--config" | "-c" => {
                 let Some(path) = args.next() else {
                     return Err("--config requires a path".to_string());
@@ -234,6 +279,12 @@ where
                         .to_string(),
                 );
             }
+            if runner_config_env.is_none() && legacy_agent_config_env.is_some() {
+                eprintln!(
+                    "webcodex-runner warning: WEBCODEX_AGENT_CONFIG is deprecated; use WEBCODEX_RUNNER_CONFIG instead. Legacy startup compatibility will be removed in WebCodex {}.",
+                    runner_config::paths::LEGACY_RUNNER_CONFIG_REMOVAL_VERSION
+                );
+            }
             runner_config_env
                 .or(legacy_agent_config_env)
                 .map(PathBuf::from)
@@ -245,6 +296,7 @@ where
         config_path,
         once,
         stop_on_stdin_eof,
+        computer_session_dir,
     })
 }
 
@@ -1397,6 +1449,10 @@ fn disable_job_state_reconciliation_for_test() -> bool {
 
 fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabilities {
     let mut capabilities = cfg.capabilities.clone().unwrap_or_default();
+    // This binary accepts a structured local sh/bash selector on raw shell
+    // requests. Older Runners omit the bit so current Servers fail closed.
+    capabilities.explicit_shell_selection = true;
+    capabilities.bash_login_shell = true;
     capabilities.jobs = true;
     capabilities.file_read = true;
     capabilities.file_write = true;
@@ -1419,6 +1475,11 @@ fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabilities {
     // Line scopes are an additive rolling-upgrade fence: advertise only because
     // this binary resolves full-match containment before any mutation.
     capabilities.apply_text_edit_line_scope = true;
+    // Deterministic whole-line range replacement is an additive rolling-upgrade
+    // capability and must never be inferred from generic line_scope support.
+    capabilities.apply_text_edit_range = true;
+    // This binary proves explicit all-match cardinality before any file write.
+    capabilities.apply_text_edit_expected_match_count = true;
     // Codex Patch is an additive request kind with Runner-authoritative parsing and
     // transaction semantics. Older Runners omit it and must fail closed.
     capabilities.apply_patch = true;
@@ -1452,6 +1513,9 @@ fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabilities {
     // `--lib` expands the older structured Cargo test argv vocabulary, so
     // advertise it separately for mixed Server/Runner rolling upgrades.
     capabilities.structured_cargo_test_lib = true;
+    // Repeated `-p` selectors expand the older single-package Cargo check argv
+    // vocabulary, so advertise this independently for rolling upgrades.
+    capabilities.structured_cargo_check_packages = true;
     // This binary accepts both legacy Go validation argv from old Servers and
     // the current machine-readable JSON argv. Do not trust static config or
     // infer this from generic structured validation support.
@@ -1474,6 +1538,7 @@ fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabilities {
     // JavaScript. This bit means the binary understands the semantic protocol;
     // local Node availability/version is resolved only when execution starts.
     capabilities.structured_script_typescript = true;
+    capabilities.structured_script_python = true;
     capabilities.internal_posix_script = true;
     capabilities.structured_execution_jobs = true;
     // Detached process ownership is an independent additive authority. Until
@@ -1517,6 +1582,10 @@ fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabilities {
     let browser_available = webcodex_browser::discover_chromium_executable().is_some();
     capabilities.browser_observe = browser_available;
     capabilities.browser_control = browser_available;
+    // This binary publishes exact snapshot node `actions` and enforces the same
+    // admission set before element effects. Keep it separate from generic Browser
+    // control so a new Server cannot dispatch the stricter contract to an older Runner.
+    capabilities.browser_element_action_admission = browser_available;
     capabilities.browser_launch = browser_available;
     // Native read-only desktop observation is implemented only on macOS and
     // Windows. Unsupported platforms advertise false and fail closed.
@@ -1603,6 +1672,7 @@ fn build_register_request_with_provider_status(
     Arc<webcodex_runner::external_tools::ExternalToolRouter>,
     u64,
 ) {
+    webcodex_runner::computer_session::set_server_availability_contract(false);
     let hot = runtime.snapshot();
     let mut capabilities = runner_register_capabilities(cfg);
     let coding_agent_providers = runtime
@@ -1623,6 +1693,7 @@ fn build_register_request_with_provider_status(
             hostname: cfg.hostname.clone().or_else(hostname),
             host_context: cfg.host_context.clone(),
             capabilities,
+            computer_session_availability: webcodex_runner::computer_session::availability(),
             policy: Some(register_policy_summary(
                 &hot,
                 prepared_cache_count,
@@ -1664,6 +1735,9 @@ fn runner_build_info() -> runner_protocol::RunnerBuildInfo {
         version: Some(info.version.to_string()),
         git_commit: info.git_commit.map(str::to_string),
         git_dirty: info.git_dirty,
+        built_at: info.built_at.map(str::to_string),
+        target: info.target.map(str::to_string),
+        architecture: info.architecture.map(str::to_string),
     }
 }
 
@@ -1725,9 +1799,18 @@ fn build_shell_profiles_summary(
         .and_then(|profile| profile.program.clone())
         .unwrap_or_else(|| shell.program.clone());
     let default_dialect = shell_dialect_for_program(&default_program).to_string();
-    // Explicit shell=sh|bash always resolves on the runner; configured custom
-    // profiles add the custom dialect.
-    let mut available: Vec<String> = vec!["sh".to_string(), "bash".to_string()];
+    // Report only semantic shells this exact Runner can resolve through its
+    // effective execution PATH. This keeps model recovery guidance from
+    // suggesting bash/sh merely because the protocol supports those selectors.
+    let mut available: Vec<String> = Vec::new();
+    for (name, language) in [
+        ("sh", runner_protocol::ShellScriptLanguage::Sh),
+        ("bash", runner_protocol::ShellScriptLanguage::Bash),
+    ] {
+        if webcodex_runner::explicit_shell_available(shell, language) {
+            available.push(name.to_string());
+        }
+    }
     for entry in &profiles {
         if let Some(dialect) = entry.dialect.as_deref() {
             if !available.iter().any(|existing| existing == dialect) {
@@ -1803,6 +1886,14 @@ fn register(
     let response: RunnerRegisterResponse = post_json(client, cfg, RUNNER_REGISTER_PATH, &body)
         .map_err(|error| RegisterError::from_http(error, &cfg.client_id))?;
     if response.success {
+        webcodex_runner::computer_session::set_server_availability_contract(
+            webcodex_runner::computer_session::registration_echo_confirms_contract(
+                response
+                    .client
+                    .as_ref()
+                    .and_then(|client| client.computer_session_availability),
+            ),
+        );
         provider.mark_status_reported(provider_revision);
         let inventory_status = response
             .client
@@ -1832,7 +1923,16 @@ fn is_file_request_kind(kind: &str) -> bool {
         || is_artifact_request_kind(kind)
 }
 
+#[cfg(test)]
 fn handle_file_operation(policy: &RunnerPolicy, operation: &RunnerFileOperation) -> CommandResult {
+    handle_file_operation_with_artifact_store(policy, operation, None)
+}
+
+fn handle_file_operation_with_artifact_store(
+    policy: &RunnerPolicy,
+    operation: &RunnerFileOperation,
+    artifact_store_root: Option<&Path>,
+) -> CommandResult {
     let request = operation.payload();
     let path = request.path.as_str();
     let start = Instant::now();
@@ -1881,9 +1981,12 @@ fn handle_file_operation(policy: &RunnerPolicy, operation: &RunnerFileOperation)
         | RunnerFileOperation::ArtifactUploadBegin(_)
         | RunnerFileOperation::ArtifactUploadChunk(_)
         | RunnerFileOperation::ArtifactUploadFinish(_)
-        | RunnerFileOperation::ArtifactUploadAbort(_) => {
-            handle_artifact_file_operation(operation, &resolved, start)
-        }
+        | RunnerFileOperation::ArtifactUploadAbort(_) => handle_artifact_file_operation_with_store(
+            operation,
+            &resolved,
+            start,
+            artifact_store_root,
+        ),
         #[cfg(feature = "workspace-checkpoints")]
         RunnerFileOperation::CheckpointCreate(_) | RunnerFileOperation::CheckpointRestore(_) => {
             handle_checkpoint_file_request(operation, &resolved, start)
@@ -2310,6 +2413,7 @@ fn handle_one_poll(
                     revision,
                 )
             });
+    let computer_session_update = webcodex_runner::computer_session::changed_availability();
     let poll = RunnerPollPayload {
         request: RunnerPollRequest {
             client_id: cfg.client_id.clone(),
@@ -2321,6 +2425,7 @@ fn handle_one_poll(
         mcp_gateway_providers: provider_update
             .as_ref()
             .map(|_| runtime.mcp_gateway().provider_inventory()),
+        computer_session_availability: computer_session_update,
         project_inventory_page,
     };
     let response: RunnerPollResponse = match post_json(client, cfg, RUNNER_POLL_PATH, &poll) {
@@ -2340,6 +2445,9 @@ fn handle_one_poll(
             &cfg.client_id,
             response.error,
         ));
+    }
+    if let Some(available) = computer_session_update {
+        webcodex_runner::computer_session::mark_availability_reported(available);
     }
     if let Some((_, provider, revision)) = provider_update {
         provider.mark_status_reported(revision);
@@ -2442,9 +2550,67 @@ fn handle_one_poll(
 }
 
 fn main() {
-    if let Some(code) =
-        webcodex_runner::detached_job::maybe_run_internal_mode(std::env::args().skip(1))
-    {
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let service = match webcodex_environment::runtime_entry::split_windows_service_args(&raw_args) {
+        Ok(service) => service,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
+    if let Some((name, args)) = service {
+        #[cfg(windows)]
+        {
+            let (config_path, computer_session_dir) = match parse_service_runner_args(&args) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(2);
+                }
+            };
+            let result =
+                webcodex_environment::service::runtime::run_windows_service(&name, move |stop| {
+                    let log_dir = config_path
+                        .parent()
+                        .ok_or("Runner config has no parent directory")?;
+                    let mut service_log = webcodex_environment::service::ServiceLogGuard::open(
+                        log_dir,
+                        webcodex_environment::service::Component::Runner,
+                    )?;
+                    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+                    let _ = tracing_subscriber::fmt()
+                        .with_env_filter(
+                            EnvFilter::try_from_default_env()
+                                .unwrap_or_else(|_| EnvFilter::new("info")),
+                        )
+                        .try_init();
+                    let cfg = load_config(&config_path)?;
+                    let result = run_runner(
+                        cfg,
+                        config_path,
+                        false,
+                        false,
+                        Some(computer_session_dir),
+                        Some(stop),
+                    );
+                    if result.is_ok() {
+                        service_log.stopped()?;
+                    }
+                    result
+                });
+            if let Err(error) = result {
+                eprintln!("webcodex-runner service failed: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (name, args);
+            unreachable!("service prefix rejected on non-Windows");
+        }
+    }
+    if let Some(code) = webcodex_runner::detached_job::maybe_run_internal_mode(raw_args.iter()) {
         std::process::exit(code);
     }
     // Pin the process start timestamp before any transport work so register
@@ -2464,12 +2630,20 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let (config_path, once, stop_on_stdin_eof) = match action {
+    let (config_path, once, stop_on_stdin_eof, computer_session_dir) = match action {
         RunnerCliAction::Run {
             config_path,
             once,
             stop_on_stdin_eof,
-        } => (config_path, once, stop_on_stdin_eof),
+            computer_session_dir,
+        } => (config_path, once, stop_on_stdin_eof, computer_session_dir),
+        RunnerCliAction::ComputerSessionHelper { session_state_dir } => {
+            if let Err(error) = webcodex_runner::computer_session::run_helper(&session_state_dir) {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+            return;
+        }
         RunnerCliAction::Exit {
             code,
             stdout,
@@ -2484,9 +2658,29 @@ fn main() {
             std::process::exit(code);
         }
     };
+    #[cfg(target_os = "macos")]
+    let mut service_log = match webcodex_environment::service::ServiceLogGuard::from_managed_env(
+        webcodex_environment::service::Component::Runner,
+    ) {
+        Ok(log) => log,
+        Err(error) => {
+            eprintln!("Runner service lifecycle log unavailable: {error}");
+            std::process::exit(2);
+        }
+    };
+    if config_path.file_name().and_then(|name| name.to_str())
+        == Some(runner_config::paths::LEGACY_AGENT_CONFIG_FILE)
+    {
+        eprintln!(
+            "webcodex-runner warning: legacy Runner config filename 'agent.toml' is deprecated; rename it to 'runner.toml' before WebCodex {}.",
+            runner_config::paths::LEGACY_RUNNER_CONFIG_REMOVAL_VERSION
+        );
+    }
     let cfg = match load_config(&config_path) {
         Ok(cfg) => cfg,
         Err(e) => {
+            #[cfg(target_os = "macos")]
+            drop(service_log);
             eprintln!("{}", e);
             std::process::exit(2);
         }
@@ -2496,9 +2690,23 @@ fn main() {
             "webcodex-runner warning: agent token is empty; connecting without Authorization; the server must be started with --open"
         );
     }
-    if let Err(e) = run_runner(cfg, config_path, once, stop_on_stdin_eof) {
+    if let Err(e) = run_runner(
+        cfg,
+        config_path,
+        once,
+        stop_on_stdin_eof,
+        computer_session_dir,
+        #[cfg(windows)]
+        None,
+    ) {
+        #[cfg(target_os = "macos")]
+        drop(service_log);
         eprintln!("webcodex-runner failed: {}", e);
         std::process::exit(1);
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(log) = service_log.as_mut() {
+        let _ = log.stopped();
     }
 }
 

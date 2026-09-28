@@ -814,7 +814,16 @@ fn ensure_control_root(state: &mut SshPoolState) -> Result<PathBuf, String> {
         return Ok(root.clone());
     }
     for _ in 0..4 {
-        let candidate = std::env::temp_dir().join(format!(
+        // macOS per-user TMPDIR is already ~50 bytes; appending our random
+        // directory, control name and OpenSSH's temporary mux suffix exceeds
+        // sockaddr_un.sun_path before any remote command can start. Use the
+        // short system temp parent there, retaining exclusive creation, a
+        // full random UUID and 0700 ownership on the actual private directory.
+        #[cfg(target_os = "macos")]
+        let parent = PathBuf::from("/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let parent = std::env::temp_dir();
+        let candidate = parent.join(format!(
             "wc-ssh-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()
@@ -844,6 +853,10 @@ fn ensure_control_root(state: &mut SshPoolState) -> Result<PathBuf, String> {
         "ssh_connection_pool_unavailable: could not allocate Runner-local control socket directory; command was not started".to_string(),
     )
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "ssh_macos_control_path_tests.rs"]
+mod macos_control_path_tests;
 
 fn establish_control_socket(connection: &SshConnection) -> Result<(), String> {
     let mut ssh = ssh_command(connection);
@@ -3828,7 +3841,10 @@ fn main() {
         let pool = SshConnectionPool::default();
         let authored = "'".repeat(crate::runner_protocol::RAW_SHELL_COMMAND_MAX_BYTES);
         let wrapped = explicit_bash_wire_command(&authored);
-        assert_eq!(wrapped.len(), 64_015);
+        assert_eq!(
+            wrapped.len(),
+            explicit_bash_wire_command("").len() + 4 * authored.len()
+        );
         assert!(wrapped.len() <= crate::runner_protocol::RAW_SHELL_WIRE_MAX_BYTES);
 
         let max_host = "h".repeat(512);
@@ -3841,7 +3857,7 @@ fn main() {
                 None,
                 &wrapped,
             )
-            .expect("prepare 16K quote-dense explicit bash command");
+            .expect("prepare maximum-size quote-dense explicit bash command");
         let args = command_args(&prepared.command);
         assert_direct_args(&args, &max_host);
         assert_eq!(

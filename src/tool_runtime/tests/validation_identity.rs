@@ -81,6 +81,8 @@ async fn promoted_run_shell_preserves_assertion_identity_in_terminal_validation_
         crate::runner_protocol::RunnerCapabilities {
             shell: true,
             async_shell_jobs: true,
+            explicit_shell_selection: true,
+            bash_login_shell: true,
             ..Default::default()
         },
         vec![registered_project("demo", &tmp.path().to_string_lossy())],
@@ -134,8 +136,6 @@ async fn promoted_run_shell_preserves_assertion_identity_in_terminal_validation_
             status: "running".to_string(),
             stdout_chunk: Some("validation-shell\n".to_string()),
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: None,
             duration_ms: None,
@@ -150,9 +150,7 @@ async fn promoted_run_shell_preserves_assertion_identity_in_terminal_validation_
         .unwrap();
     let handoff = task.await.unwrap();
     assert!(handoff.success, "{:?}", handoff.error);
-    assert!(handoff.output.get("promoted_to_job").is_none());
-    assert_eq!(handoff.output["continuation"]["tool"], "observe_jobs");
-    assert_eq!(handoff.output["job_id"], job_id);
+    assert_eq!(assert_sparse_pending_job_handoff(&handoff.output), job_id);
 
     runtime
         .runner_registry
@@ -163,10 +161,8 @@ async fn promoted_run_shell_preserves_assertion_identity_in_terminal_validation_
             job_id,
             request_id: Some(request.request_id),
             status: "completed".to_string(),
-            stdout_chunk: None,
+            stdout_chunk: Some("validation-shell passed\n".to_string()),
             stderr_chunk: None,
-            stdout_tail: Some("validation-shell passed\n".to_string()),
-            stderr_tail: Some(String::new()),
             log_snapshot: None,
             exit_code: Some(0),
             duration_ms: Some(12),

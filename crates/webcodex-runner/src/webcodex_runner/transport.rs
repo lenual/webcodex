@@ -160,9 +160,14 @@ fn send_provider_metadata(
                 "publishing current Runner metadata after config generation changed"
             );
         }
-        let Some((mut status, revision)) = config.external_tools.claim_status_update() else {
+        let provider_update = config.external_tools.claim_status_update();
+        let availability_update = super::computer_session::changed_availability();
+        if provider_update.is_none() && availability_update.is_none() {
             return;
-        };
+        }
+        let had_provider_update = provider_update.is_some();
+        let (mut status, revision) =
+            provider_update.unwrap_or_else(|| config.external_tools.registration_status());
         status.config_reload = config.reload_status();
         if try_send_runner_stream_control(
             transport,
@@ -170,11 +175,19 @@ fn send_provider_metadata(
             RunnerEnvelope::RuntimeMetadata {
                 tool_providers: status,
                 mcp_gateway_providers: Some(runtime.mcp_gateway().provider_inventory()),
+                computer_session_availability: availability_update,
             },
         ) {
-            config.external_tools.mark_status_reported(revision);
+            if had_provider_update {
+                config.external_tools.mark_status_reported(revision);
+            }
+            if let Some(available) = availability_update {
+                super::computer_session::mark_availability_reported(available);
+            }
         } else {
-            config.external_tools.release_status_update(revision);
+            if had_provider_update {
+                config.external_tools.release_status_update(revision);
+            }
         }
     });
 }
@@ -510,7 +523,59 @@ fn install_shutdown_listener(
         .map_err(|_| "failed to start process shutdown signal listener".to_string())
 }
 
+#[cfg(windows)]
+fn install_service_stop_listener(
+    runtime: RunnerRuntimeState,
+    stop: webcodex_environment::service::runtime::ServiceStop,
+) -> Result<std::thread::JoinHandle<()>, String> {
+    std::thread::Builder::new()
+        .name("webcodex-runner-scm-stop".to_string())
+        .spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                runtime.request_shutdown_signal();
+                return;
+            };
+            rt.block_on(async {
+                tokio::select! {
+                    _ = stop.cancelled() => runtime.request_shutdown_signal(),
+                    _ = runtime.wait_for_shutdown() => {},
+                }
+            });
+        })
+        .map_err(|_| "failed to start SCM stop listener".to_string())
+}
+
+#[cfg(windows)]
+const PARENT_PIPE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+#[cfg(windows)]
 fn install_parent_liveness_listener(runtime: RunnerRuntimeState) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_PIPE};
+
+    let stdin = std::io::stdin();
+    let handle = stdin.as_raw_handle() as usize;
+    if unsafe { GetFileType(handle as _) } == FILE_TYPE_PIPE {
+        let listener = spawn_windows_pipe_parent_liveness_listener(handle, runtime)?;
+        // The process owns stdin for its whole lifetime. The listener stops on
+        // pipe EOF/error or an already-requested Runner shutdown, so detaching
+        // the JoinHandle does not transfer ownership of any external resource.
+        drop(listener);
+        return Ok(());
+    }
+
+    install_blocking_parent_liveness_listener(runtime)
+}
+
+#[cfg(not(windows))]
+fn install_parent_liveness_listener(runtime: RunnerRuntimeState) -> Result<(), String> {
+    install_blocking_parent_liveness_listener(runtime)
+}
+
+fn install_blocking_parent_liveness_listener(runtime: RunnerRuntimeState) -> Result<(), String> {
     use std::io::Read;
 
     let listener = std::thread::Builder::new()
@@ -529,12 +594,74 @@ fn install_parent_liveness_listener(runtime: RunnerRuntimeState) -> Result<(), S
             }
         })
         .map_err(|_| "failed to start parent-liveness listener".to_string())?;
-    // This reader is intentionally detached. A blocking stdin read cannot be
-    // cancelled portably; joining it during an ordinary signal-driven shutdown
-    // would hang until the parent closed the lease. Process exit reclaims the
-    // detached thread, while EOF still triggers exact-generation shutdown.
+    // Non-pipe stdin may require a genuinely blocking read. Keep the legacy
+    // detached behavior for consoles and Unix streams; process exit reclaims
+    // the listener while EOF still triggers exact-generation shutdown.
     drop(listener);
     Ok(())
+}
+
+#[cfg(windows)]
+fn spawn_windows_pipe_parent_liveness_listener(
+    pipe_handle: usize,
+    runtime: RunnerRuntimeState,
+) -> Result<std::thread::JoinHandle<()>, String> {
+    use windows_sys::Win32::Storage::FileSystem::ReadFile;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    std::thread::Builder::new()
+        .name("webcodex-runner-parent-lease".to_string())
+        .spawn(move || {
+            let pipe = pipe_handle as windows_sys::Win32::Foundation::HANDLE;
+            let mut discard = [0_u8; 64];
+            loop {
+                if runtime.shutdown_requested() {
+                    return;
+                }
+
+                let mut available = 0_u32;
+                let peeked = unsafe {
+                    PeekNamedPipe(
+                        pipe,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        &mut available,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if peeked == 0 {
+                    // Preserve the historical lease contract: any stdin read
+                    // failure is equivalent to parent EOF and requests Runner
+                    // shutdown. Broken anonymous pipes land here without a
+                    // blocking ReadFile on the Windows startup path.
+                    runtime.request_shutdown_signal();
+                    return;
+                }
+
+                if available == 0 {
+                    std::thread::sleep(PARENT_PIPE_POLL_INTERVAL);
+                    continue;
+                }
+
+                let to_read = available.min(discard.len() as u32);
+                let mut bytes_read = 0_u32;
+                let read = unsafe {
+                    ReadFile(
+                        pipe,
+                        discard.as_mut_ptr(),
+                        to_read,
+                        &mut bytes_read,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if read == 0 || bytes_read == 0 {
+                    runtime.request_shutdown_signal();
+                    return;
+                }
+            }
+        })
+        .map_err(|_| "failed to start parent-liveness listener".to_string())
 }
 
 fn send_polling_offline_best_effort(client: &Client, cfg: &RunnerConfig, runner_instance_id: &str) {
@@ -852,6 +979,8 @@ pub(crate) fn run_runner(
     config_path: PathBuf,
     once: bool,
     stop_on_stdin_eof: bool,
+    computer_session_dir: Option<PathBuf>,
+    #[cfg(windows)] service_stop: Option<webcodex_environment::service::runtime::ServiceStop>,
 ) -> Result<(), String> {
     // Generate the per-process agent instance identity once. It is stable for
     // the whole process lifetime, including across WebSocket reconnects, so the
@@ -859,6 +988,9 @@ pub(crate) fn run_runner(
     // It is not a secret and is never persisted to disk. Windows exit diagnostics
     // use a separate local diagnostic id and therefore preserve that boundary.
     let runner_instance_id = uuid::Uuid::new_v4().to_string();
+    if let Some(dir) = computer_session_dir {
+        super::computer_session::configure(dir, runner_instance_id.clone())?;
+    }
     let transport = cfg
         .transport
         .as_deref()
@@ -939,6 +1071,16 @@ pub(crate) fn run_runner(
         }
     };
     runtime.register_background_thread(shutdown_listener);
+    #[cfg(windows)]
+    if let Some(stop) = service_stop {
+        match install_service_stop_listener(runtime.clone(), stop) {
+            Ok(listener) => runtime.register_background_thread(listener),
+            Err(error) => {
+                runtime.shutdown();
+                return Err(error);
+            }
+        }
+    }
     #[cfg(windows)]
     if let Some(diagnostics) = exit_diagnostics.as_ref() {
         diagnostics.mark_running();
@@ -2262,9 +2404,18 @@ fn registered_ack(ack: RunnerEnvelope) -> Result<ShellProjectInventoryStatus, St
             success: true,
             client,
             ..
-        } => client
-            .and_then(|client| client.project_inventory)
-            .ok_or_else(|| "register acknowledgement missing canonical project_inventory status; Server is incompatible with this 0.4 Runner".to_string()),
+        } => {
+            super::computer_session::set_server_availability_contract(
+                super::computer_session::registration_echo_confirms_contract(
+                    client
+                        .as_ref()
+                        .and_then(|view| view.computer_session_availability),
+                ),
+            );
+            client
+                .and_then(|client| client.project_inventory)
+                .ok_or_else(|| "register acknowledgement missing canonical project_inventory status; Server is incompatible with this 0.4 Runner".to_string())
+        }
         RunnerEnvelope::Registered { error, .. } => Err(format!(
             "register rejected by server: {}",
             error.unwrap_or_else(|| "no server error message".to_string())

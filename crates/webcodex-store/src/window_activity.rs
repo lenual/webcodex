@@ -5,6 +5,7 @@ use crate::models::{
 use crate::Database;
 use rusqlite::{params, Connection};
 use std::collections::BTreeSet;
+use webcodex_core::workflow_session_contract::is_safe_job_id;
 
 // Window history is already bounded by ActionAudit retention. Keep the human
 // console able to inspect the retained set instead of imposing tiny UI-only caps.
@@ -42,6 +43,7 @@ impl Database {
         let sql = format!(
             "SELECT e.client_window_key,
                     MAX(e.client_window_source),
+                    MIN(e.window_ended_at_ms),
                     MAX(e.window_ended_at_ms),
                     MAX(CASE WHEN e.action_name = 'toolsCall' THEN e.window_ended_at_ms END),
                     MAX(CASE WHEN e.window_meaningful = 1 THEN e.window_ended_at_ms END),
@@ -67,11 +69,12 @@ impl Database {
             out.push(WindowActivitySummaryRecord {
                 client_window_key: row.get(0)?,
                 client_window_source: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                last_seen_at_ms: row.get(2)?,
-                last_tool_call_at_ms: row.get(3)?,
-                last_meaningful_activity_at_ms: row.get(4)?,
-                linked_session_count: usize::try_from(row.get::<_, i64>(5)?).unwrap_or(usize::MAX),
-                recorder_gap_count: usize::try_from(row.get::<_, i64>(6)?).unwrap_or(usize::MAX),
+                first_seen_at_ms: row.get(2)?,
+                last_seen_at_ms: row.get(3)?,
+                last_tool_call_at_ms: row.get(4)?,
+                last_meaningful_activity_at_ms: row.get(5)?,
+                linked_session_count: usize::try_from(row.get::<_, i64>(6)?).unwrap_or(usize::MAX),
+                recorder_gap_count: usize::try_from(row.get::<_, i64>(7)?).unwrap_or(usize::MAX),
             });
         }
         Ok(out)
@@ -115,6 +118,7 @@ impl Database {
             Some((kind, id)) => conn
                 .query_row(
                     "SELECT e.client_window_key, MAX(e.client_window_source),
+                            MIN(e.window_ended_at_ms),
                             MAX(e.window_ended_at_ms),
                             MAX(CASE WHEN e.action_name = 'toolsCall' THEN e.window_ended_at_ms END),
                             MAX(CASE WHEN e.window_meaningful = 1 THEN e.window_ended_at_ms END),
@@ -134,6 +138,7 @@ impl Database {
             None => conn
                 .query_row(
                     "SELECT e.client_window_key, MAX(e.client_window_source),
+                            MIN(e.window_ended_at_ms),
                             MAX(e.window_ended_at_ms),
                             MAX(CASE WHEN e.action_name = 'toolsCall' THEN e.window_ended_at_ms END),
                             MAX(CASE WHEN e.window_meaningful = 1 THEN e.window_ended_at_ms END),
@@ -168,7 +173,7 @@ impl Database {
                     e.principal_correlation_kind, e.principal_correlation_id,
                     e.request_observed_at_ms, e.response_handed_at_ms,
                     e.window_transition_kind, e.response_streaming,
-                    e.window_continuity_eligible
+                    e.window_continuity_eligible, e.http_status, e.ids_json
              FROM action_events e
              WHERE e.client_window_key = ?1
                AND e.window_started_at_ms IS NOT NULL
@@ -193,6 +198,116 @@ impl Database {
         collect_window_event_rows(&conn, &mut rows, None)
     }
 
+    /// Exact bounded lookup used by App-only lazy Window detail reads.
+    /// The caller still owns principal and Project visibility authorization.
+    pub fn get_window_activity_event_by_trace(
+        &self,
+        window_key: &str,
+        principal: Option<(&str, &str)>,
+        server_trace_id: &str,
+    ) -> anyhow::Result<Option<WindowActivityEventRecord>> {
+        let conn = self.lock_connection(crate::StoreDomain::WindowActivity);
+        let select = "SELECT e.event_id, e.client_window_key, e.client_window_source,
+                    e.server_trace_id, e.window_started_at_ms, e.window_ended_at_ms,
+                    e.duration_ms, e.action_name, e.operation, e.project, e.status,
+                    e.window_meaningful, e.recorder_gap_session_id,
+                    e.principal_correlation_kind, e.principal_correlation_id,
+                    e.request_observed_at_ms, e.response_handed_at_ms,
+                    e.window_transition_kind, e.response_streaming,
+                    e.window_continuity_eligible, e.http_status, e.ids_json
+             FROM action_events e";
+        let mut records = match principal {
+            Some((kind, id)) => {
+                let sql = format!(
+                    "{select}
+                     WHERE e.client_window_key = ?1
+                       AND e.server_trace_id = ?2
+                       AND e.window_started_at_ms IS NOT NULL
+                       AND e.window_ended_at_ms IS NOT NULL
+                       AND e.principal_correlation_kind = ?3
+                       AND e.principal_correlation_id = ?4
+                     ORDER BY e.event_id DESC
+                     LIMIT 1"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                collect_window_events(
+                    &conn,
+                    &mut stmt,
+                    params![window_key, server_trace_id, kind, id],
+                    None,
+                )?
+            }
+            None => {
+                let sql = format!(
+                    "{select}
+                     WHERE e.client_window_key = ?1
+                       AND e.server_trace_id = ?2
+                       AND e.window_started_at_ms IS NOT NULL
+                       AND e.window_ended_at_ms IS NOT NULL
+                     ORDER BY e.event_id DESC
+                     LIMIT 1"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                collect_window_events(&conn, &mut stmt, params![window_key, server_trace_id], None)?
+            }
+        };
+        Ok(records.pop())
+    }
+    /// Goal liveness needs the latest meaningful work even after thousands of
+    /// transport-only App polls. Reuse the action ledger, with a bounded page of
+    /// meaningful events plus the newest observation; never maintain another clock.
+    pub fn list_goal_window_activity_events(
+        &self,
+        window_key: &str,
+        principal: Option<(&str, &str)>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WindowActivityEventRecord>> {
+        let conn = self.lock_connection(crate::StoreDomain::WindowActivity);
+        let (kind, id) = principal
+            .map(|(kind, id)| (Some(kind), Some(id)))
+            .unwrap_or((None, None));
+        let mut statement = conn.prepare(
+            "WITH selected AS (
+                SELECT event_id FROM (
+                    SELECT event_id FROM action_events
+                    WHERE client_window_key = ?1 AND window_meaningful = 1
+                      AND window_started_at_ms IS NOT NULL AND window_ended_at_ms IS NOT NULL
+                      AND (?2 IS NULL OR (principal_correlation_kind = ?2 AND principal_correlation_id = ?3))
+                    ORDER BY window_ended_at_ms DESC, event_id DESC LIMIT ?4
+                )
+                UNION
+                SELECT event_id FROM (
+                    SELECT event_id FROM action_events
+                    WHERE client_window_key = ?1
+                      AND window_started_at_ms IS NOT NULL AND window_ended_at_ms IS NOT NULL
+                      AND (?2 IS NULL OR (principal_correlation_kind = ?2 AND principal_correlation_id = ?3))
+                    ORDER BY window_ended_at_ms DESC, event_id DESC LIMIT 1
+                )
+             )
+             SELECT e.event_id, e.client_window_key, e.client_window_source,
+                    e.server_trace_id, e.window_started_at_ms, e.window_ended_at_ms,
+                    e.duration_ms, e.action_name, e.operation, e.project, e.status,
+                    e.window_meaningful, e.recorder_gap_session_id,
+                    e.principal_correlation_kind, e.principal_correlation_id,
+                    e.request_observed_at_ms, e.response_handed_at_ms,
+                    e.window_transition_kind, e.response_streaming, e.window_continuity_eligible, e.http_status,
+                    e.ids_json
+             FROM action_events e JOIN selected s ON s.event_id = e.event_id
+             ORDER BY e.window_ended_at_ms DESC, e.event_id DESC",
+        )?;
+        collect_window_events(
+            &conn,
+            &mut statement,
+            params![
+                window_key,
+                kind,
+                id,
+                bounded_limit(limit, MAX_WINDOW_ACTIVITY_LIMIT)
+            ],
+            None,
+        )
+    }
+
     /// Variant used only by feature-gated Code Mode Runtime Console dogfood.
     /// The ordinary Window query above intentionally keeps its historical SQL
     /// and does not read ActionAudit summary JSON.
@@ -212,7 +327,7 @@ impl Database {
                     e.principal_correlation_kind, e.principal_correlation_id,
                     e.request_observed_at_ms, e.response_handed_at_ms,
                     e.window_transition_kind, e.response_streaming,
-                    e.window_continuity_eligible, e.summary_json
+                    e.window_continuity_eligible, e.http_status, e.ids_json, e.summary_json
              FROM action_events e
              WHERE e.client_window_key = ?1
                AND e.window_started_at_ms IS NOT NULL
@@ -230,11 +345,11 @@ impl Database {
                 drop(stmt);
                 let mut stmt = conn.prepare(&sql)?;
                 let records =
-                    collect_window_events(&conn, &mut stmt, params![window_key, limit], Some(20))?;
+                    collect_window_events(&conn, &mut stmt, params![window_key, limit], Some(22))?;
                 return Ok(records);
             }
         };
-        collect_window_event_rows(&conn, &mut rows, Some(20))
+        collect_window_event_rows(&conn, &mut rows, Some(22))
     }
 
     /// Latest authoritative Window/Session relation for diagnostic continuity.
@@ -405,11 +520,12 @@ fn window_summary_from_row(
     Ok(WindowActivitySummaryRecord {
         client_window_key: row.get(0)?,
         client_window_source: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-        last_seen_at_ms: row.get(2)?,
-        last_tool_call_at_ms: row.get(3)?,
-        last_meaningful_activity_at_ms: row.get(4)?,
-        linked_session_count: usize::try_from(row.get::<_, i64>(5)?).unwrap_or(usize::MAX),
-        recorder_gap_count: usize::try_from(row.get::<_, i64>(6)?).unwrap_or(usize::MAX),
+        first_seen_at_ms: row.get(2)?,
+        last_seen_at_ms: row.get(3)?,
+        last_tool_call_at_ms: row.get(4)?,
+        last_meaningful_activity_at_ms: row.get(5)?,
+        linked_session_count: usize::try_from(row.get::<_, i64>(6)?).unwrap_or(usize::MAX),
+        recorder_gap_count: usize::try_from(row.get::<_, i64>(7)?).unwrap_or(usize::MAX),
     })
 }
 
@@ -423,6 +539,40 @@ fn collect_window_events<P: rusqlite::Params>(
     collect_window_event_rows(conn, &mut rows, code_mode_summary_column)
 }
 
+fn window_job_correlation_from_ids_json(ids_json: Option<String>) -> (Option<String>, Vec<String>) {
+    let Some(value) = ids_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+    else {
+        return (None, Vec::new());
+    };
+    let async_job_id = value
+        .get("async_job_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|job_id| is_safe_job_id(job_id))
+        .map(str::to_string);
+    let mut observed_job_ids = Vec::new();
+    if let Some(items) = value
+        .get("observed_job_ids")
+        .and_then(serde_json::Value::as_array)
+    {
+        for item in items.iter().take(8) {
+            let Some(job_id) = item
+                .as_str()
+                .map(str::trim)
+                .filter(|job_id| is_safe_job_id(job_id))
+            else {
+                continue;
+            };
+            if !observed_job_ids.iter().any(|existing| existing == job_id) {
+                observed_job_ids.push(job_id.to_string());
+            }
+        }
+    }
+    (async_job_id, observed_job_ids)
+}
+
 fn collect_window_event_rows(
     conn: &Connection,
     rows: &mut rusqlite::Rows<'_>,
@@ -431,6 +581,7 @@ fn collect_window_event_rows(
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
         let event_id: String = row.get(0)?;
+        let (async_job_id, observed_job_ids) = window_job_correlation_from_ids_json(row.get(21)?);
         out.push(WindowActivityEventRecord {
             event_id: event_id.clone(),
             client_window_key: row.get(1)?,
@@ -444,6 +595,8 @@ fn collect_window_event_rows(
             project: row.get(9)?,
             status: row.get(10)?,
             meaningful: row.get(11)?,
+            async_job_id,
+            observed_job_ids,
             recorder_gap_session_id: row.get(12)?,
             workflow_links: workflow_links_for_event(conn, &event_id)?,
             principal_correlation_kind: row.get(13)?,
@@ -453,6 +606,7 @@ fn collect_window_event_rows(
             window_transition_kind: row.get(17)?,
             response_streaming: row.get(18)?,
             window_continuity_eligible: row.get(19)?,
+            http_status: row.get(20)?,
             code_mode_composition: match code_mode_summary_column {
                 Some(column) => row
                     .get::<_, Option<String>>(column)?
@@ -616,6 +770,59 @@ mod tests {
             .collect::<Vec<_>>();
         db.append_action_event_and_update_session(&event, &records, 1, 0, 0, 0, 1, 0, 0)
             .unwrap();
+    }
+
+    #[test]
+    fn window_activity_projects_safe_job_identity_from_audit_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(&tmp.path().join("window-jobs.db")).unwrap();
+        seed_session(&db);
+        let mut item = event("job-a", "wj", "alice", "agent:r:p", 1_000);
+        item.ids_json = serde_json::json!({
+            "async_job_id": "wc_job_background_123",
+            "observed_job_ids": [
+                "wc_job_observed_456",
+                "../unsafe",
+                "wc_job_observed_456"
+            ],
+            "observation_token": "must-not-project"
+        })
+        .to_string();
+        append(&db, item, &[]);
+
+        let rows = db
+            .list_window_activity_events("wj", Some(("username", "alice")), 20)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].async_job_id.as_deref(),
+            Some("wc_job_background_123")
+        );
+        assert_eq!(
+            rows[0].observed_job_ids,
+            vec!["wc_job_observed_456".to_string()]
+        );
+    }
+
+    #[test]
+    fn window_summary_tracks_first_seen_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(&tmp.path().join("window-first-seen.db")).unwrap();
+        seed_session(&db);
+        append(&db, event("first", "wf", "alice", "agent:r:p", 1_000), &[]);
+        append(&db, event("later", "wf", "alice", "agent:r:p", 5_000), &[]);
+
+        let summary = db
+            .get_window_activity_summary("wf", Some(("username", "alice")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.first_seen_at_ms, 1_001);
+        assert_eq!(summary.last_seen_at_ms, 5_001);
+
+        let list = db
+            .list_window_activity_summaries(Some(("username", "alice")), 20)
+            .unwrap();
+        assert_eq!(list[0].first_seen_at_ms, 1_001);
     }
 
     #[test]

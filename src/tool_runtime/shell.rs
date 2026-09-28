@@ -188,6 +188,11 @@ impl ToolRuntime {
             || lower.contains("unknown_project")
         {
             "agent_offline"
+        } else if lower.contains("capability_unavailable")
+            || lower.contains("agent_capability_unavailable")
+            || lower.contains("does not support")
+        {
+            "capability_unavailable"
         } else if lower.contains("permission")
             || lower.contains("denied")
             || lower.contains("outside")
@@ -260,6 +265,7 @@ impl ToolRuntime {
             self.runner_registry
                 .enqueue_run(
                     ShellRunRequest {
+                        login: false,
                         client_id,
                         cwd: effective_cwd,
                         command,
@@ -430,6 +436,7 @@ impl ToolRuntime {
             cwd,
             purpose,
             shell,
+            false,
             None,
             None,
             None,
@@ -447,10 +454,18 @@ impl ToolRuntime {
         cwd: Option<String>,
         purpose: Option<ExecutionPurpose>,
         shell: Option<ExecutionShell>,
+        login: bool,
         ssh_resource: Option<&str>,
         session_id: Option<&str>,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
+        if login && (shell != Some(ExecutionShell::Bash) || ssh_resource.is_some()) {
+            return Self::run_shell_tool_failure_result(
+                "run_shell login=true requires local shell=bash".to_string(),
+                "invalid_arguments",
+                ShellCommandExecutionState::NotStarted,
+            );
+        }
         if let Err(error) = validate_raw_shell_command_length(&command) {
             return Self::run_shell_tool_failure_result(
                 command_rejected_message(
@@ -558,28 +573,38 @@ impl ToolRuntime {
                 ShellCommandExecutionState::NotStarted,
             );
         }
-        let actual_shell = shell
-            .map(ExecutionShell::as_str)
-            .unwrap_or(if ssh_resource.is_some() {
-                "remote"
-            } else {
-                "configured"
-            });
-        let dispatched_command =
-            match shell {
-                Some(shell) => match explicit_shell_dispatch_command(&command, shell.as_str()) {
+        let actual_shell = if login {
+            "bash_login"
+        } else {
+            shell
+                .map(ExecutionShell::as_str)
+                .unwrap_or(if ssh_resource.is_some() {
+                    "remote"
+                } else {
+                    "configured"
+                })
+        };
+        let dispatched_command = match (ssh_resource, shell) {
+            // Named SSH keeps the existing remote-login-shell compatibility
+            // wrapper. Local explicit shells are selected structurally by the
+            // Runner, so never expose this POSIX wrapper to configured PowerShell.
+            (Some(_), Some(shell)) => {
+                match explicit_shell_dispatch_command(&command, shell.as_str()) {
                     Ok(command) => command,
-                    Err(error) => return Self::run_shell_tool_failure_result(
-                        command_rejected_message(
-                            error,
-                            "use run_script for large or quote-dense explicit-shell program text.",
-                        ),
-                        "runtime_error",
-                        ShellCommandExecutionState::NotStarted,
-                    ),
-                },
-                None => command.clone(),
-            };
+                    Err(error) => {
+                        return Self::run_shell_tool_failure_result(
+                            command_rejected_message(
+                                error,
+                                "use run_script for substantially larger typed program text.",
+                            ),
+                            "runtime_error",
+                            ShellCommandExecutionState::NotStarted,
+                        )
+                    }
+                }
+            }
+            _ => command.clone(),
+        };
         let handoff_requested = ssh_resource.is_none() && timeout > budget.sync_wait_secs;
         let async_handoff_available = if handoff_requested {
             let features = match self
@@ -615,6 +640,7 @@ impl ToolRuntime {
                 }
             };
             features.supports(RunnerFeature::Shell)
+                && shell.is_none_or(|_| features.supports(RunnerFeature::ExplicitShellSelection))
                 && (features.supports(RunnerFeature::AsyncJobs)
                     || features.supports(RunnerFeature::AsyncShellJobs))
         } else {
@@ -649,6 +675,7 @@ impl ToolRuntime {
                         client_id: Some(client_id.clone()),
                         cwd: effective_cwd.clone(),
                         command: Some(dispatched_command.clone()),
+                        login,
                         timeout_secs: Some(timeout),
                         job_id: None,
                         since_stdout_line: None,
@@ -664,6 +691,7 @@ impl ToolRuntime {
                         project_cwd: Some(resolved_cwd.clone()),
                         purpose: Some(declared_purpose.as_str().to_string()),
                         shell: Some(actual_shell.to_string()),
+                        explicit_shell: if ssh_resource.is_none() { shell } else { None },
                         visibility: ShellJobVisibility::HiddenUntilHandoff,
                         ..Default::default()
                     },
@@ -798,6 +826,7 @@ impl ToolRuntime {
                     client_id,
                     cwd: effective_cwd,
                     command: dispatched_command,
+                    login,
                     stdin: None,
                     timeout_secs: timeout,
                     wait_timeout_secs: wait_timeout,
@@ -807,6 +836,7 @@ impl ToolRuntime {
                 ssh_resource
                     .zip(session_id)
                     .map(|(_, session_id)| session_id.to_string()),
+                if ssh_resource.is_none() { shell } else { None },
             )
             .await
         {

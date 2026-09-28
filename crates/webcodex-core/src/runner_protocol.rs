@@ -7,26 +7,27 @@ mod job;
 mod transport;
 
 pub use job::{
-    normalize_cargo_value, normalize_go_test_packages, normalize_rust_test_filter,
-    valid_rust_test_filter, RunnerJobLogRequest, RunnerJobLogResponse, RunnerJobResult,
-    RunnerJobStatusRequest, RunnerJobStatusResponse, RunnerJobStopRequest, RunnerJobStopResponse,
-    RunnerJobUpdateRequest, RunnerJobUpdateResponse, RunnerJobsListRequest, RunnerJobsListResponse,
-    RunnerShellJobResult, ShellJobActivity, ShellJobActivityPhase, ShellJobActivitySource,
-    ShellJobActivityState, ShellJobCodexMetadata, ShellJobContext, ShellJobInfo, ShellJobInventory,
-    ShellJobLogSnapshot, ShellJobOpRequest, ShellJobOpResponse, ShellJobSnapshot,
-    ShellJobStreamSnapshot, ShellJobStructuredExecutionMetadata, ShellJobTestCountEvidence,
-    ShellJobValidationMetadata, ShellJobValidationProgress, ShellJobValidationStep,
-    CARGO_TEST_MIN_TESTS_MAX, CARGO_VALUE_MAX_BYTES, GO_TEST_PACKAGE_MAX_BYTES,
-    GO_TEST_PACKAGE_MAX_ITEMS, JOB_INVENTORY_MAX_ACTIVE_JOBS, JOB_INVENTORY_MAX_JOBS,
-    JOB_INVENTORY_MAX_SERIALIZED_BYTES, JOB_INVENTORY_MAX_TERMINAL_JOBS,
-    JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS, RUNNER_JOB_CONCURRENCY_MAX,
-    RUNNER_JOB_CONCURRENCY_MIN, RUST_TEST_FILTER_MAX_BYTES, VALIDATION_ASSERTION_NAME_MAX_CHARS,
+    normalize_cargo_packages, normalize_cargo_value, normalize_go_test_packages,
+    normalize_rust_test_filter, valid_rust_test_filter, RunnerJobLogRequest, RunnerJobLogResponse,
+    RunnerJobResult, RunnerJobStatusRequest, RunnerJobStatusResponse, RunnerJobStopRequest,
+    RunnerJobStopResponse, RunnerJobUpdateRequest, RunnerJobUpdateResponse, RunnerJobsListRequest,
+    RunnerJobsListResponse, RunnerShellJobResult, ShellJobActivity, ShellJobActivityPhase,
+    ShellJobActivitySource, ShellJobActivityState, ShellJobCodexMetadata, ShellJobContext,
+    ShellJobInfo, ShellJobInventory, ShellJobLogSnapshot, ShellJobOpRequest, ShellJobOpResponse,
+    ShellJobSnapshot, ShellJobStreamSnapshot, ShellJobStructuredExecutionMetadata,
+    ShellJobTestCountEvidence, ShellJobValidationMetadata, ShellJobValidationProgress,
+    ShellJobValidationStep, CARGO_PACKAGE_MAX_ITEMS, CARGO_TEST_MIN_TESTS_MAX,
+    CARGO_VALUE_MAX_BYTES, GO_TEST_PACKAGE_MAX_BYTES, GO_TEST_PACKAGE_MAX_ITEMS,
+    JOB_INVENTORY_MAX_ACTIVE_JOBS, JOB_INVENTORY_MAX_JOBS, JOB_INVENTORY_MAX_SERIALIZED_BYTES,
+    JOB_INVENTORY_MAX_TERMINAL_JOBS, JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS,
+    RUNNER_JOB_CONCURRENCY_MAX, RUNNER_JOB_CONCURRENCY_MIN, RUST_TEST_FILTER_MAX_BYTES,
+    VALIDATION_ASSERTION_NAME_MAX_CHARS,
 };
 
 pub use transport::{
     encode_quic_frame, encode_quic_register_frame, read_quic_frame, read_quic_register_frame,
     write_quic_frame, write_quic_register_frame, QuicFrameError, QuicRegisterFrame, RunnerEnvelope,
-    QUIC_FRAME_MAX_BYTES,
+    QUIC_FRAME_MAX_BYTES, RUNNER_ENVELOPE_MAX_BYTES,
 };
 
 pub const EXTERNAL_SEARCH_REQUEST_PREFIX: &str = "# webcodex:search_project_text:v1";
@@ -58,18 +59,19 @@ fn default_transport_polling() -> String {
     "polling".to_string()
 }
 
-/// Model/user-authored raw shell command ceiling. Raw shell remains a bounded
-/// escape hatch; larger program text belongs in `run_script`, while large
-/// literal data belongs in stdin/files/artifacts.
-pub const RAW_SHELL_COMMAND_MAX_BYTES: usize = 16_000;
+/// Model/user-authored raw shell command ceiling. Keep already-authored shell
+/// programs executable without forcing a second model turn just to move the
+/// same text into `run_script`; substantially larger typed programs still use
+/// that 512 KiB path, while large literal data belongs in stdin/files/artifacts.
+pub const RAW_SHELL_COMMAND_MAX_BYTES: usize = 64 * 1024;
 
-/// Internal Control -> Runner raw-shell command envelope. This is deliberately
-/// larger than the authored-command ceiling because an explicit `sh`/`bash`
-/// request is transported through the existing POSIX single-quote wrapper.
-/// In the worst case every authored byte is a single quote, expanding a
-/// 16,000-byte command to about 64 KiB. This transport bound is not a model
-/// input allowance.
-pub const RAW_SHELL_WIRE_MAX_BYTES: usize = 64 * 1024;
+/// Internal Control -> Runner raw-shell command envelope. Local explicit
+/// `sh`/`bash` execution is selected structurally, so its command body stays
+/// unexpanded. Session SSH compatibility still uses POSIX single-quote
+/// escaping, whose worst case expands every authored byte 4x; retain an
+/// additional fixed 1 KiB for wrapper syntax while staying well below the
+/// typed-script payload ceiling.
+pub const RAW_SHELL_WIRE_MAX_BYTES: usize = 4 * RAW_SHELL_COMMAND_MAX_BYTES + 1024;
 
 /// Validate the internal raw-shell request envelope accepted by Control and
 /// revalidated by the Runner. Model-facing authored commands use the smaller
@@ -140,6 +142,11 @@ pub const RUNNER_PROTOCOL_GENERATION_V2: RunnerProtocolGenerationNumber =
 pub const RUNNER_QUIC_ALPN_V1: &str = "webcodex-runner/1";
 
 pub const RUNNER_CAPABILITY_SHELL: &str = "shell";
+/// Structured local `sh`/`bash` selection on raw shell requests. Missing on
+/// older Runners is false; current Servers fail closed rather than sending a
+/// POSIX `exec ... -c` wrapper to an unrelated configured shell.
+pub const RUNNER_CAPABILITY_EXPLICIT_SHELL_SELECTION: &str = "explicit_shell_selection";
+pub const RUNNER_CAPABILITY_BASH_LOGIN_SHELL: &str = "bash_login_shell";
 pub const RUNNER_CAPABILITY_FILE_READ: &str = "file_read";
 pub const RUNNER_CAPABILITY_FILE_WRITE: &str = "file_write";
 /// The Runner implements a narrow internal project-artifact export chunk read
@@ -171,6 +178,14 @@ pub const RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LOCAL_GUARD_WITHOUT_SHA: &str =
 /// false and is never inferred from occurrence, protocol generation, file_write,
 /// version, transport, OS, or build identity.
 pub const RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE: &str = "apply_text_edit_line_scope";
+/// The Runner understands deterministic revision-fenced whole-line replacement
+/// edits (`replace_range`). Missing on older Runners is false and is never
+/// inferred from line_scope support or protocol generation.
+pub const RUNNER_CAPABILITY_APPLY_TEXT_EDIT_RANGE: &str = "apply_text_edit_range";
+/// Runner enforces explicit bounded all-match cardinality against one original
+/// source snapshot. Missing on older Runners is false; never inferred.
+pub const RUNNER_CAPABILITY_APPLY_TEXT_EDIT_EXPECTED_MATCH_COUNT: &str =
+    "apply_text_edit_expected_match_count";
 /// Authoritative Runner-side Codex Patch parsing plus bounded transactional apply.
 /// Missing on older Runners is false and is never inferred from file_write or
 /// protocol generation, so a new Server cannot send this request kind to an old Runner.
@@ -220,6 +235,11 @@ pub const RUNNER_CAPABILITY_STRUCTURED_CARGO_TEST_EXECUTION_POLICY: &str =
 /// `--lib` selector. Older Runners may already support structured Cargo argv
 /// without this additive selector, so newer Servers must fence it explicitly.
 pub const RUNNER_CAPABILITY_STRUCTURED_CARGO_TEST_LIB: &str = "structured_cargo_test_lib";
+/// The Runner accepts one canonical Cargo check validation step containing
+/// repeated `-p <package>` selectors. Older Runners accepted at most one
+/// package even when they advertised generic structured validation argv.
+pub const RUNNER_CAPABILITY_STRUCTURED_CARGO_CHECK_PACKAGES: &str =
+    "structured_cargo_check_packages";
 /// The Runner accepts the canonical machine-readable `go test -json` validation
 /// shape. Older implementations may support only the historical fixed `./...`
 /// scope; expanded caller-selected packages are fenced separately.
@@ -256,6 +276,8 @@ pub const RUNNER_CAPABILITY_STRUCTURED_SCRIPT_JAVASCRIPT: &str = "structured_scr
 /// JavaScript without understanding this newer wire enum variant. This bit
 /// describes protocol semantics, not local Node.js executable/version support.
 pub const RUNNER_CAPABILITY_STRUCTURED_SCRIPT_TYPESCRIPT: &str = "structured_script_typescript";
+/// Additive typed Python script language; missing on older Runners is false.
+pub const RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PYTHON: &str = "structured_script_python";
 /// Runner-owned WebCodex-generated POSIX programs execute through an explicit
 /// internal runtime instead of the configured interactive shell. Missing on
 /// older Runners is false so Control never sends the dedicated request kind to
@@ -304,6 +326,11 @@ pub const RUNNER_CAPABILITY_BROWSER_OBSERVE: &str = "browser_observe";
 /// Missing on older Runners is false and is never inferred from Browser observation,
 /// Computer control, OS identity, protocol generation, or shell support.
 pub const RUNNER_CAPABILITY_BROWSER_CONTROL: &str = "browser_control";
+/// The Runner projects exact per-element Browser actions from the current semantic
+/// snapshot and enforces the same action admission before each element effect.
+/// Missing on older Runners is false and is never inferred from browser_control.
+pub const RUNNER_CAPABILITY_BROWSER_ELEMENT_ACTION_ADMISSION: &str =
+    "browser_element_action_admission";
 /// Runner-owned creation of an ephemeral Chromium-family Browser runtime. Missing
 /// on older Runners is false and is never inferred from executable/platform facts.
 pub const RUNNER_CAPABILITY_BROWSER_LAUNCH: &str = "browser_launch";
@@ -437,6 +464,8 @@ pub const RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES: &[&str] = &[
 
 pub const RUNNER_CAPABILITY_NAMES: &[&str] = &[
     RUNNER_CAPABILITY_SHELL,
+    RUNNER_CAPABILITY_EXPLICIT_SHELL_SELECTION,
+    RUNNER_CAPABILITY_BASH_LOGIN_SHELL,
     RUNNER_CAPABILITY_FILE_READ,
     RUNNER_CAPABILITY_FILE_WRITE,
     RUNNER_CAPABILITY_ARTIFACT_EXPORT_CHUNK_READ,
@@ -445,6 +474,8 @@ pub const RUNNER_CAPABILITY_NAMES: &[&str] = &[
     RUNNER_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE,
     RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LOCAL_GUARD_WITHOUT_SHA,
     RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE,
+    RUNNER_CAPABILITY_APPLY_TEXT_EDIT_RANGE,
+    RUNNER_CAPABILITY_APPLY_TEXT_EDIT_EXPECTED_MATCH_COUNT,
     RUNNER_CAPABILITY_APPLY_PATCH,
     RUNNER_CAPABILITY_APPLY_PATCH_MATCH_METADATA,
     RUNNER_CAPABILITY_APPLY_PATCH_MATCHING_MODE,
@@ -459,11 +490,13 @@ pub const RUNNER_CAPABILITY_NAMES: &[&str] = &[
     RUNNER_CAPABILITY_STRUCTURED_CARGO_TEST_COUNT_ASSERTION,
     RUNNER_CAPABILITY_STRUCTURED_CARGO_TEST_EXECUTION_POLICY,
     RUNNER_CAPABILITY_STRUCTURED_CARGO_TEST_LIB,
+    RUNNER_CAPABILITY_STRUCTURED_CARGO_CHECK_PACKAGES,
     RUNNER_CAPABILITY_STRUCTURED_GO_TEST_JSON,
     RUNNER_CAPABILITY_STRUCTURED_GO_TEST_TOOL,
     RUNNER_CAPABILITY_STRUCTURED_GO_TEST_PACKAGES,
     RUNNER_CAPABILITY_STRUCTURED_PROCESS_ARGV,
     RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
+    RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PYTHON,
     RUNNER_CAPABILITY_STRUCTURED_SCRIPT_JAVASCRIPT,
     RUNNER_CAPABILITY_STRUCTURED_SCRIPT_TYPESCRIPT,
     RUNNER_CAPABILITY_INTERNAL_POSIX_SCRIPT,
@@ -479,6 +512,7 @@ pub const RUNNER_CAPABILITY_NAMES: &[&str] = &[
     RUNNER_CAPABILITY_SKILL_MANAGEMENT,
     RUNNER_CAPABILITY_BROWSER_OBSERVE,
     RUNNER_CAPABILITY_BROWSER_CONTROL,
+    RUNNER_CAPABILITY_BROWSER_ELEMENT_ACTION_ADMISSION,
     RUNNER_CAPABILITY_BROWSER_LAUNCH,
     RUNNER_CAPABILITY_COMPUTER_OBSERVE,
     RUNNER_CAPABILITY_COMPUTER_APPLICATION_DISCOVERY,
@@ -523,6 +557,12 @@ pub const PROJECT_INVENTORY_MAX_CONCURRENT_SYNCS: usize = 8;
 pub struct RunnerCapabilities {
     #[serde(default = "default_shell_true")]
     pub shell: bool,
+    /// Additive structured selector for explicit local `sh`/`bash` raw shell
+    /// execution. Missing on older Runners is false and is never inferred.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub explicit_shell_selection: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bash_login_shell: bool,
     #[serde(default)]
     pub file_read: bool,
     #[serde(default)]
@@ -552,6 +592,11 @@ pub struct RunnerCapabilities {
     /// Runners is false and is never inferred from occurrence or generation.
     #[serde(default, skip_serializing_if = "is_false")]
     pub apply_text_edit_line_scope: bool,
+    /// Deterministic 1-based inclusive whole-line replacement support.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub apply_text_edit_range: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub apply_text_edit_expected_match_count: bool,
     /// Authoritative Codex-compatible patch parsing and transactional application.
     /// Missing on older Runners is false and never follows from generic file_write.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -601,6 +646,11 @@ pub struct RunnerCapabilities {
     /// Runners is false and is never inferred from generic structured argv.
     #[serde(default, skip_serializing_if = "is_false")]
     pub structured_cargo_test_lib: bool,
+    /// Additive canonical Cargo check support for repeated `-p` selectors in
+    /// one validation argv. Missing on older Runners is false and is never
+    /// inferred from generic structured validation support.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub structured_cargo_check_packages: bool,
     /// Machine-readable canonical `go test -json` validation. Older Runners may
     /// support only the historical fixed `./...` scope; focused package argv is
     /// an independent additive capability.
@@ -637,6 +687,8 @@ pub struct RunnerCapabilities {
     /// and native TypeScript support are resolved separately at execution time.
     #[serde(default, skip_serializing_if = "is_false")]
     pub structured_script_typescript: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub structured_script_python: bool,
     /// Dedicated server-generated POSIX script request kind. Missing on older
     /// Runners is false and is never inferred from raw shell or typed public
     /// script support.
@@ -688,6 +740,10 @@ pub struct RunnerCapabilities {
     /// Runner-owned Browser control excluding process launch.
     #[serde(default, skip_serializing_if = "is_false")]
     pub browser_control: bool,
+    /// Exact snapshot-advertised element action admission. Missing on older Runners
+    /// is false and never follows from generic Browser observation/control.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub browser_element_action_admission: bool,
     /// Runner-owned launch of ephemeral Chromium-family runtimes.
     #[serde(default, skip_serializing_if = "is_false")]
     pub browser_launch: bool,
@@ -1000,6 +1056,8 @@ impl Default for RunnerCapabilities {
     fn default() -> Self {
         Self {
             shell: true,
+            explicit_shell_selection: false,
+            bash_login_shell: false,
             file_read: false,
             file_write: false,
             artifact_export_chunk_read: false,
@@ -1008,6 +1066,8 @@ impl Default for RunnerCapabilities {
             apply_text_edit_occurrence: false,
             apply_text_edit_local_guard_without_sha: false,
             apply_text_edit_line_scope: false,
+            apply_text_edit_range: false,
+            apply_text_edit_expected_match_count: false,
             apply_patch: false,
             apply_patch_match_metadata: false,
             apply_patch_matching_mode: false,
@@ -1022,6 +1082,7 @@ impl Default for RunnerCapabilities {
             structured_cargo_test_count_assertion: false,
             structured_cargo_test_execution_policy: false,
             structured_cargo_test_lib: false,
+            structured_cargo_check_packages: false,
             structured_go_test_json: false,
             structured_go_test_tool: false,
             structured_go_test_packages: false,
@@ -1029,6 +1090,7 @@ impl Default for RunnerCapabilities {
             structured_script_payload: false,
             structured_script_javascript: false,
             structured_script_typescript: false,
+            structured_script_python: false,
             internal_posix_script: false,
             structured_execution_jobs: false,
             detached_process_jobs: false,
@@ -1042,6 +1104,7 @@ impl Default for RunnerCapabilities {
             skill_management: false,
             browser_observe: false,
             browser_control: false,
+            browser_element_action_admission: false,
             browser_launch: false,
             computer_observe: false,
             computer_application_discovery: false,
@@ -1222,9 +1285,9 @@ pub struct ShellProfilesSummary {
     /// actual configuration; the server never guesses. Older Runners omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_dialect: Option<String>,
-    /// Dialects an explicit `shell=` selection can resolve to on this runner
-    /// (always includes `sh` and `bash`; configured custom profiles add
-    /// `custom`). Older Runners omit it.
+    /// Dialects this exact Runner can resolve from its effective execution
+    /// environment for explicit `shell=` selection; configured custom profiles
+    /// may additionally report `custom`. Older Runners omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub available_dialects: Option<Vec<String>>,
 }
@@ -1370,6 +1433,10 @@ pub struct RunnerRegisterRequest {
     /// inherits the pre-0.4 missing-field=true behavior.
     #[serde(deserialize_with = "deserialize_registration_capabilities")]
     pub capabilities: RunnerCapabilities,
+    /// Current brokered login-session eligibility. Absent on transient and
+    /// older Runners, which retain their existing direct Computer behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer_session_availability: Option<bool>,
     /// Optional bounded planning context declared by the Runner configuration.
     /// This is descriptive metadata only: it never grants authority or proves
     /// current host/service/network state.
@@ -1420,6 +1487,15 @@ pub struct RunnerBuildInfo {
     /// was captured. `None` means exact source alignment is unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_dirty: Option<bool>,
+    /// Stable build timestamp/epoch string emitted by the build identity pipeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub built_at: Option<String>,
+    /// Cargo target triple for this Runner binary. Never a filesystem path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Cargo target architecture for this Runner binary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<String>,
 }
 
 pub const RUNNER_HOST_CONTEXT_ROLE_MAX_BYTES: usize = 64;
@@ -1544,6 +1620,8 @@ pub struct RunnerView {
     pub connected: bool,
     pub last_seen: i64,
     pub capabilities: RunnerCapabilities,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer_session_availability: Option<bool>,
     /// Bounded sanitized startup-owned ACP provider inventory. Logical ids are
     /// model-visible planning metadata; executable/argv/env/PID/private ACP ids
     /// never enter this view.
@@ -1624,6 +1702,8 @@ pub struct ShellRunRequest {
     #[serde(default)]
     pub cwd: Option<String>,
     pub command: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub login: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stdin: Option<String>,
     #[serde(default = "default_timeout_secs")]
@@ -1652,6 +1732,7 @@ pub enum ShellScriptLanguage {
     Sh,
     Bash,
     Powershell,
+    Python,
     Javascript,
     Typescript,
 }
@@ -1662,6 +1743,7 @@ impl ShellScriptLanguage {
             Self::Sh => "sh",
             Self::Bash => "bash",
             Self::Powershell => "powershell",
+            Self::Python => "python",
             Self::Javascript => "javascript",
             Self::Typescript => "typescript",
         }
@@ -1671,6 +1753,7 @@ impl ShellScriptLanguage {
         match self {
             Self::Sh | Self::Bash => ".sh",
             Self::Powershell => ".ps1",
+            Self::Python => ".py",
             Self::Javascript => ".mjs",
             Self::Typescript => ".mts",
         }
@@ -1769,7 +1852,7 @@ pub fn validate_process_argv(process: &ShellProcessArgv) -> Result<(), String> {
     }
     if process_uses_shell_command_mode(process) {
         return Err(
-            "run_process does not accept shell command modes; use run_shell for shell syntax"
+            "run_process does not accept shell command modes; use run_shell for shell grammar/short chains or run_script for program-like scripts"
                 .to_string(),
         );
     }
@@ -1934,6 +2017,9 @@ pub struct RunnerPollPayload {
     /// metadata update; `Some([])` explicitly clears the active inventory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_gateway_providers: Option<Vec<crate::mcp_gateway::McpGatewayProvider>>,
+    /// Changed-only login-session eligibility for a brokered persistent Runner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer_session_availability: Option<bool>,
     /// Optional bounded project inventory page for the canonical paged inventory protocol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_inventory_page: Option<ShellProjectInventoryPage>,
@@ -1966,6 +2052,14 @@ pub struct RunnerRequest {
     #[serde(default)]
     pub create_dirs: bool,
     pub command: String,
+    /// Optional semantic local-shell selector for raw shell execution. Present
+    /// only for `kind = "run_shell"` or `kind = "start_job"`. Older Runners
+    /// ignore it, so current Servers send it only after explicit capability
+    /// admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<crate::workflow_session_contract::ExecutionShell>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub login: bool,
     /// Typed native process payload. Present only for `kind = "run_process"`
     /// or `kind = "start_process_job"`; defaults to `None` for backward
     /// compatibility with older envelopes.
@@ -2362,6 +2456,7 @@ mod envelope_tests {
 
     fn sample_process_request() -> RunnerRequest {
         RunnerRequest {
+            login: false,
             request_id: "req-process-1".to_string(),
             client_id: "ws-1".to_string(),
             kind: "run_process".to_string(),
@@ -2376,6 +2471,7 @@ mod envelope_tests {
             end_line: None,
             create_dirs: false,
             command: String::new(),
+            shell: None,
             process: Some(ShellProcessArgv {
                 executable: "argv-helper".to_string(),
                 args: vec![
@@ -2430,6 +2526,7 @@ mod envelope_tests {
 
     fn sample_script_request() -> RunnerRequest {
         RunnerRequest {
+            login: false,
             request_id: "req-script-1".to_string(),
             client_id: "ws-1".to_string(),
             kind: "run_script".to_string(),
@@ -2444,6 +2541,7 @@ mod envelope_tests {
             end_line: None,
             create_dirs: false,
             command: String::new(),
+            shell: None,
             process: None,
             script: Some(ShellScriptPayload {
                 language: ShellScriptLanguage::Bash,
@@ -2537,6 +2635,7 @@ mod envelope_tests {
 
     fn sample_register() -> RunnerRegisterRequest {
         RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             client_id: "ws-1".to_string(),
@@ -2548,6 +2647,8 @@ mod envelope_tests {
             host_context: None,
             capabilities: RunnerCapabilities {
                 shell: true,
+                explicit_shell_selection: false,
+                bash_login_shell: false,
                 file_read: true,
                 file_write: false,
                 artifact_export_chunk_read: false,
@@ -2556,6 +2657,8 @@ mod envelope_tests {
                 apply_text_edit_occurrence: false,
                 apply_text_edit_local_guard_without_sha: false,
                 apply_text_edit_line_scope: false,
+                apply_text_edit_range: false,
+                apply_text_edit_expected_match_count: false,
                 apply_patch: false,
                 apply_patch_match_metadata: false,
                 apply_patch_matching_mode: false,
@@ -2570,6 +2673,7 @@ mod envelope_tests {
                 structured_cargo_test_count_assertion: true,
                 structured_cargo_test_execution_policy: true,
                 structured_cargo_test_lib: true,
+                structured_cargo_check_packages: true,
                 structured_go_test_json: true,
                 structured_go_test_tool: true,
                 structured_go_test_packages: true,
@@ -2577,6 +2681,7 @@ mod envelope_tests {
                 structured_script_payload: true,
                 structured_script_javascript: true,
                 structured_script_typescript: true,
+                structured_script_python: true,
                 internal_posix_script: true,
                 structured_execution_jobs: true,
                 detached_process_jobs: true,
@@ -2590,6 +2695,7 @@ mod envelope_tests {
                 skill_management: false,
                 browser_observe: false,
                 browser_control: false,
+                browser_element_action_admission: false,
                 browser_launch: false,
                 computer_observe: false,
                 computer_application_discovery: false,
@@ -2742,6 +2848,30 @@ mod envelope_tests {
         let capabilities: RunnerCapabilities =
             serde_json::from_str(r#"{"project_path_registration":true}"#).unwrap();
         assert!(capabilities.project_path_registration);
+    }
+
+    #[test]
+    fn browser_element_action_admission_is_additive_and_default_false() {
+        let legacy: RunnerCapabilities = serde_json::from_str(
+            r#"{"browser_observe":true,"browser_control":true,"browser_launch":true}"#,
+        )
+        .unwrap();
+        assert!(legacy.browser_observe);
+        assert!(legacy.browser_control);
+        assert!(!legacy.browser_element_action_admission);
+        assert!(legacy.browser_launch);
+
+        let present: RunnerCapabilities =
+            serde_json::from_str(r#"{"browser_element_action_admission":true}"#).unwrap();
+        assert!(present.browser_element_action_admission);
+        assert!(!present.browser_observe);
+        assert!(!present.browser_control);
+        assert!(!present.browser_launch);
+        assert!(
+            RUNNER_CAPABILITY_NAMES.contains(&RUNNER_CAPABILITY_BROWSER_ELEMENT_ACTION_ADMISSION)
+        );
+        assert!(!RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES
+            .contains(&RUNNER_CAPABILITY_BROWSER_ELEMENT_ACTION_ADMISSION));
     }
 
     #[test]
@@ -3010,6 +3140,7 @@ mod envelope_tests {
     #[test]
     fn request_envelope_flattens_shell_request_fields() {
         let request = RunnerRequest {
+            login: false,
             request_id: "req-1".to_string(),
             client_id: "ws-1".to_string(),
             kind: "run_shell".to_string(),
@@ -3024,6 +3155,7 @@ mod envelope_tests {
             end_line: None,
             create_dirs: false,
             command: "echo hi".to_string(),
+            shell: Some(crate::workflow_session_contract::ExecutionShell::Bash),
             process: None,
             script: None,
             stdin: Some("input".to_string()),
@@ -3044,12 +3176,17 @@ mod envelope_tests {
         assert!(json.contains(r#""request_id":"req-1""#));
         assert!(json.contains(r#""kind":"run_shell""#));
         assert!(json.contains(r#""command":"echo hi""#));
+        assert!(json.contains(r#""shell":"bash""#));
         assert!(json.contains(r#""stdin":"input""#));
         let back = RunnerEnvelope::from_slice(json.as_bytes()).unwrap();
         match back {
             RunnerEnvelope::Request { request } => {
                 assert_eq!(request.request_id, "req-1");
                 assert_eq!(request.command, "echo hi");
+                assert_eq!(
+                    request.shell,
+                    Some(crate::workflow_session_contract::ExecutionShell::Bash)
+                );
             }
             other => panic!("expected request, got {:?}", other.kind()),
         }
@@ -3371,6 +3508,17 @@ mod envelope_tests {
     }
 
     #[test]
+    fn python_script_language_is_canonical_and_uses_py() {
+        assert_eq!(ShellScriptLanguage::Python.as_str(), "python");
+        assert_eq!(ShellScriptLanguage::Python.file_extension(), ".py");
+        assert_eq!(
+            serde_json::to_string(&ShellScriptLanguage::Python).unwrap(),
+            "\"python\""
+        );
+        assert!(serde_json::from_str::<ShellScriptLanguage>("\"python3\"").is_err());
+    }
+
+    #[test]
     fn typescript_script_language_is_canonical_and_uses_mts() {
         assert_eq!(ShellScriptLanguage::Typescript.as_str(), "typescript");
         assert_eq!(ShellScriptLanguage::Typescript.file_extension(), ".mts");
@@ -3618,8 +3766,6 @@ mod envelope_tests {
                 status: "running".to_string(),
                 stdout_chunk: Some("out".to_string()),
                 stderr_chunk: None,
-                stdout_tail: None,
-                stderr_tail: None,
                 log_snapshot: None,
                 exit_code: None,
                 duration_ms: None,
@@ -3633,10 +3779,43 @@ mod envelope_tests {
         };
         let json = job_env.to_json().unwrap();
         assert!(json.contains(r#""type":"job_update""#));
+        assert!(!json.contains("\"stdout_tail\""));
+        assert!(!json.contains("\"stderr_tail\""));
         match RunnerEnvelope::from_slice(json.as_bytes()).unwrap() {
             RunnerEnvelope::JobUpdate { payload } => assert_eq!(payload.job_id, "job-1"),
             other => panic!("expected job_update, got {:?}", other.kind()),
         }
+    }
+
+    #[test]
+    fn job_update_accepts_retired_null_tail_fields_for_v04_rolling_compat() {
+        let legacy = serde_json::json!({
+            "type": "job_update",
+            "client_id": "ws-1",
+            "agent_instance_id": "11111111-1111-1111-1111-111111111111",
+            "job_id": "job-v04",
+            "request_id": "req-v04",
+            "status": "running",
+            "stdout_chunk": null,
+            "stderr_chunk": null,
+            "stdout_tail": null,
+            "stderr_tail": null,
+            "finished": false
+        });
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        let decoded = RunnerEnvelope::from_slice(&bytes).unwrap();
+        match &decoded {
+            RunnerEnvelope::JobUpdate { payload } => {
+                assert_eq!(payload.job_id, "job-v04");
+                assert!(payload.stdout_chunk.is_none());
+                assert!(payload.stderr_chunk.is_none());
+            }
+            other => panic!("expected job_update, got {:?}", other.kind()),
+        }
+
+        let reencoded = decoded.to_json().unwrap();
+        assert!(!reencoded.contains("\"stdout_tail\""));
+        assert!(!reencoded.contains("\"stderr_tail\""));
     }
 
     #[test]
@@ -3691,6 +3870,7 @@ mod envelope_tests {
     fn runtime_metadata_and_legacy_poll_payloads_round_trip() {
         let env = RunnerEnvelope::RuntimeMetadata {
             tool_providers: sample_tool_providers(),
+            computer_session_availability: None,
             mcp_gateway_providers: Some(vec![crate::mcp_gateway::McpGatewayProvider {
                 provider_id: "blender".to_string(),
                 provider_instance_id: "instance-1".to_string(),
@@ -3805,6 +3985,8 @@ mod envelope_tests {
             RUNNER_CAPABILITY_NAMES,
             &[
                 "shell",
+                "explicit_shell_selection",
+                "bash_login_shell",
                 "file_read",
                 "file_write",
                 "artifact_export_chunk_read",
@@ -3813,6 +3995,8 @@ mod envelope_tests {
                 "apply_text_edit_occurrence",
                 "apply_text_edit_local_guard_without_sha",
                 "apply_text_edit_line_scope",
+                "apply_text_edit_range",
+                "apply_text_edit_expected_match_count",
                 "apply_patch",
                 "apply_patch_match_metadata",
                 "apply_patch_matching_mode",
@@ -3827,11 +4011,13 @@ mod envelope_tests {
                 "structured_cargo_test_count_assertion",
                 "structured_cargo_test_execution_policy",
                 "structured_cargo_test_lib",
+                "structured_cargo_check_packages",
                 "structured_go_test_json",
                 "structured_go_test_tool",
                 "structured_go_test_packages",
                 "structured_process_argv",
                 "structured_script_payload",
+                "structured_script_python",
                 "structured_script_javascript",
                 "structured_script_typescript",
                 "internal_posix_script",
@@ -3847,6 +4033,7 @@ mod envelope_tests {
                 "skill_management",
                 "browser_observe",
                 "browser_control",
+                "browser_element_action_admission",
                 "browser_launch",
                 "computer_observe",
                 "computer_application_discovery",
@@ -3984,8 +4171,6 @@ mod envelope_tests {
             status: "running".to_string(),
             stdout_chunk: None,
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: None,
             duration_ms: None,
@@ -4095,6 +4280,7 @@ mod envelope_tests {
     #[tokio::test]
     async fn quic_register_codec_round_trips_current_wire_shape() {
         let payload = RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             client_id: "q-1".to_string(),
@@ -4357,6 +4543,7 @@ mod filter_canonical_tests {
             vec!["check", "--features", "serde"],
             vec!["check", "--features", "a b"],
             vec!["check", "-p", "my-crate"],
+            vec!["check", "-p", "crate-a", "-p", "crate-b"],
             vec![
                 "check",
                 "--all-targets",
@@ -4385,6 +4572,7 @@ mod filter_canonical_tests {
             vec!["check", "--features", "serde  "],
             vec!["check", "--features", "line\nbreak"],
             vec!["check", "-p", "tab\tvalue"],
+            vec!["check", "-p", "same-crate", "-p", "same-crate"],
             vec!["check", "--manifest-path", "/tmp/Cargo.toml"],
             vec!["check", "--locked"],
             vec!["check", "--", "--all-targets"],
@@ -4541,8 +4729,8 @@ mod filter_canonical_tests {
 
     #[test]
     fn cargo_value_contract_normalizes_exactly_once_and_fails_closed() {
-        // The shared normalization contract used by both the synchronous
-        // command builders and the structured Job argv builder.
+        // The shared normalization contract used by adapter-owned validation
+        // plans and Runner-side canonical-step validation.
         assert_eq!(
             normalize_cargo_value("serde").unwrap(),
             Some("serde".to_string())

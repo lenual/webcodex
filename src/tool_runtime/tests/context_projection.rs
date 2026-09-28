@@ -315,6 +315,18 @@ async fn work_on_project_static_context_is_explicit_and_primary_output_stays_com
     let workflow = context_material(&requested, "webcodex.workflow");
     assert_eq!(workflow["status"], "available");
     assert_eq!(workflow["projection"]["tool_strategy"]["profile"], "direct");
+    let facts = serde_json::to_value(
+        super::super::model_ergonomics_telemetry::invocation::BootstrapFacts::from_output(
+            &requested.output,
+        ),
+    )
+    .unwrap();
+    assert_eq!(facts["instructions_available"], true);
+    assert_eq!(facts["instructions_content_included"], true);
+    assert_eq!(facts["instructions_truncated"], false);
+    assert_eq!(facts["instruction_source_count"], 1);
+    assert_eq!(facts["workflow_available"], true);
+    assert!(!facts.to_string().contains("WORK_ON_PROJECT_CONTEXT_RULE"));
 }
 
 #[cfg(feature = "experimental-code-mode")]
@@ -413,6 +425,7 @@ async fn project_instructions_context_projection_is_authorized_scoped_and_bounde
     let cross_project = runtime
         .dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context(
             ToolCall::RunShell {
+                login: false,
                 project: bravo,
                 command: "pwd".to_string(),
                 session_id: Some(session.session_id),
@@ -842,6 +855,53 @@ fn plugins_catalog_selection_projection_has_independent_hard_bound() {
     assert_eq!(projection["truncated"], true);
     assert!(projection["returned_count"].as_u64().unwrap() < 128);
     assert!(projection.get("next_cursor").is_none());
+}
+
+#[tokio::test]
+async fn workflow_context_uses_mcp_host_profile_only_for_mcp_omission() {
+    let runtime = ToolRuntime::new_for_tests().with_mcp_host_policy(
+        crate::mcp_host::McpHostConfig {
+            profile: crate::mcp_host::McpHostProfile::HostCodeMode,
+            host_budget_secs: None,
+        }
+        .runtime_policy(),
+    );
+    for (transport, expected) in [
+        (ToolTransport::Mcp, "host_code_mode"),
+        (ToolTransport::Api, "direct"),
+    ] {
+        let outcome = runtime
+            .call_tool_with_invocation_metadata(
+                ToolCallRequest {
+                    tool_name: "list_tools".to_string(),
+                    arguments: json!({}),
+                },
+                ToolCallContext {
+                    transport,
+                    session_id: None,
+                    auth: None,
+                    window: None,
+                    record_oauth_scope_denials: false,
+                    host_file_import_trust: HostFileImportTrust::Untrusted,
+                },
+                ToolInvocationMetadata {
+                    context_request: vec!["webcodex.workflow".to_string()],
+                    ..Default::default()
+                },
+                ToolProtocolCapabilities {
+                    context_sidecar: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        let result = outcome.result.expect("model-facing result");
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            context_material(&result, "webcodex.workflow")["projection"]["tool_strategy"]
+                ["profile"],
+            expected
+        );
+    }
 }
 
 #[tokio::test]

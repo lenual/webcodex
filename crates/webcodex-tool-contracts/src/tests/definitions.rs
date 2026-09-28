@@ -130,7 +130,7 @@ fn experimental_code_mode_mutating_has_conservative_e2c_combined_authority_envel
     assert_eq!(metadata.idempotency, ToolIdempotency::NonIdempotent);
     assert!(
         metadata.destructive,
-        "E2c can create/edit/delete/rename through canonical apply_text_edits"
+        "E2c can create/edit/delete/rename through canonical edit_project_files"
     );
     assert_eq!(
         metadata.authority,
@@ -187,7 +187,7 @@ fn code_mode_composition_policy_is_canonical_closed_and_independent_from_fronten
         assert_eq!(metadata.risk, ToolRisk::Read, "{name}");
     }
 
-    for name in ["cargo_check", "cargo_test", "apply_text_edits"] {
+    for name in ["cargo_check", "cargo_test", "edit_project_files"] {
         assert_eq!(
             runtime_tool_composition_policy(name),
             ToolCompositionPolicy::Sequential,
@@ -283,7 +283,7 @@ fn tool_definitions_are_activity_semantics_ssot() {
     for (name, presentation, interaction, kind) in [
         ("read_files", Work, Meaningful, Read),
         ("search_project_texts", Work, Meaningful, Search),
-        ("apply_text_edits", Work, Meaningful, Edit),
+        ("edit_project_files", Work, Meaningful, Edit),
         ("run_process", Work, Meaningful, Run),
         ("run_shell", Work, Meaningful, Run),
         ("cargo_test", Work, Meaningful, Test),
@@ -296,11 +296,19 @@ fn tool_definitions_are_activity_semantics_ssot() {
         ("observe_jobs", Transport, Meaningful, NoKind),
         ("list_jobs", Support, Meaningful, NoKind),
         ("session_handoff_summary", Support, Meaningful, NoKind),
+        ("session_handoff_state", Support, NonMeaningful, NoKind),
         ("work_on_project", Support, Meaningful, NoKind),
         ("validation_summary", Support, Meaningful, NoKind),
         ("runtime_status", Support, NonMeaningful, NoKind),
         ("tool_manifest", Support, NonMeaningful, NoKind),
-        ("goal_plan_state", Transport, NonMeaningful, NoKind),
+        ("goal_plan_sync", Transport, NonMeaningful, NoKind),
+        (
+            "bootstrap_agent_conversation",
+            Transport,
+            NonMeaningful,
+            NoKind,
+        ),
+        ("consume_agent_wake", Transport, NonMeaningful, NoKind),
         ("agent_continuation_state", Transport, NonMeaningful, NoKind),
     ] {
         assert_eq!(
@@ -321,8 +329,12 @@ fn tool_definitions_are_activity_semantics_ssot() {
         "list_projects",
         "tool_manifest",
         "read_tool_trace",
-        "goal_plan_state",
+        "goal_plan_sync",
+        "bootstrap_agent_conversation",
+        "consume_agent_wake",
         "work_result_state",
+        "work_result_send_message",
+        "session_handoff_state",
         "agent_wait_state",
         "agent_continuation_bind",
         "agent_continuation_recover_endpoint",
@@ -429,7 +441,7 @@ fn execution_selection_contract_is_canonical_closed_and_sparse() {
 
     for name in [
         "read_files",
-        "apply_text_edits",
+        "edit_project_files",
         "show_changes",
         "observe_jobs",
         "stop_job",
@@ -437,6 +449,101 @@ fn execution_selection_contract_is_canonical_closed_and_sparse() {
     ] {
         assert_eq!(runtime_tool_execution_contract(name), None, "{name}");
     }
+}
+
+#[test]
+fn host_orchestration_hints_are_static_guidance_independent_from_nested_composition() {
+    use ToolCompositionPolicy::{Denied, Parallel, Sequential};
+    use ToolHostConcurrencyHint::{IndependentParallelRead, Sequential as HostSequential};
+
+    let cases = [
+        (
+            "read_files",
+            Parallel,
+            IndependentParallelRead,
+            Some("items"),
+            false,
+        ),
+        (
+            "search_project_texts",
+            Parallel,
+            IndependentParallelRead,
+            Some("queries"),
+            false,
+        ),
+        (
+            "search_and_read",
+            Denied,
+            IndependentParallelRead,
+            Some("queries"),
+            true,
+        ),
+        ("git_status", Parallel, IndependentParallelRead, None, false),
+        (
+            "git_diff_hunks",
+            Parallel,
+            IndependentParallelRead,
+            None,
+            false,
+        ),
+        (
+            "git_review_summary",
+            Parallel,
+            IndependentParallelRead,
+            None,
+            false,
+        ),
+        (
+            "runtime_status",
+            Denied,
+            IndependentParallelRead,
+            None,
+            false,
+        ),
+        (
+            "cargo_check",
+            Sequential,
+            HostSequential,
+            Some("packages"),
+            false,
+        ),
+        ("cargo_test", Sequential, HostSequential, None, false),
+        (
+            "edit_project_files",
+            Sequential,
+            HostSequential,
+            Some("changes"),
+            false,
+        ),
+        ("observe_jobs", Denied, HostSequential, Some("items"), false),
+    ];
+
+    for (name, composition, concurrency, native_batch_field, compound_preferred) in cases {
+        let definition = lookup_tool_definition(name).unwrap_or_else(|| panic!("missing {name}"));
+        assert_eq!(definition.composition, composition, "{name}");
+        assert_eq!(
+            definition.host_orchestration.concurrency, concurrency,
+            "{name}"
+        );
+        assert_eq!(
+            definition.host_orchestration.native_batch_field, native_batch_field,
+            "{name}"
+        );
+        assert_eq!(
+            definition.host_orchestration.compound_preferred, compound_preferred,
+            "{name}"
+        );
+        assert_eq!(
+            runtime_tool_host_orchestration_hint(name),
+            definition.host_orchestration,
+            "{name}"
+        );
+    }
+
+    assert_eq!(
+        runtime_tool_host_orchestration_hint("unknown_tool"),
+        ToolHostOrchestrationHint::UNSPECIFIED
+    );
 }
 
 #[test]
@@ -518,7 +625,7 @@ fn every_runtime_tool_has_an_explicit_fail_closed_audit_contract() {
 }
 
 #[test]
-fn stop_job_direct_exposure_preserves_one_canonical_effect_and_gateway_budget() {
+fn stop_job_preserves_one_canonical_effect() {
     let definition = lookup_tool_definition("stop_job").unwrap();
     assert_eq!(
         tool_definitions()
@@ -526,12 +633,15 @@ fn stop_job_direct_exposure_preserves_one_canonical_effect_and_gateway_budget() 
             .count(),
         1
     );
-    assert_eq!(definition.adaptive_runtime_direct_rank(), Some(81));
-    assert_eq!(
-        definition.gpt_action_exposure(),
-        ToolGptActionExposure::GatewayOnly
-    );
-    assert!(definition.supports_gpt_actions());
+    assert_eq!(definition.adaptive_runtime_direct_rank(), None);
+    #[cfg(feature = "legacy-gpt-actions")]
+    {
+        assert_eq!(
+            definition.gpt_action_exposure(),
+            ToolGptActionExposure::GatewayOnly
+        );
+        assert!(definition.supports_gpt_actions());
+    }
     assert_eq!(definition.metadata.effect, ToolEffect::Mutate);
     assert_eq!(definition.metadata.risk, ToolRisk::JobRun);
     assert_eq!(definition.metadata.approval, ToolApprovalPolicy::Standard);
@@ -543,6 +653,7 @@ fn stop_job_direct_exposure_preserves_one_canonical_effect_and_gateway_budget() 
         definition.metadata.authority,
         ToolAuthorityPolicy::Require(JOB_RUN)
     );
+    #[cfg(feature = "legacy-gpt-actions")]
     assert!(!gpt_action_direct_tool_definitions()
         .iter()
         .any(|item| item.name == "stop_job"));
@@ -558,7 +669,7 @@ fn stop_job_direct_exposure_preserves_one_canonical_effect_and_gateway_budget() 
         "read_files",
         "search_project_texts",
         "git_status",
-        "apply_text_edits",
+        "edit_project_files",
     ] {
         let schema = input_schema_for_tool(name);
         let properties = schema["properties"].as_object().unwrap();
@@ -650,16 +761,16 @@ fn adaptive_runtime_direct_declarations_are_visible_ranked_and_unique() {
     }
     assert_eq!(derived.len(), seen_ranks.len());
     let apply_patch = lookup_tool_definition("apply_patch").expect("apply_patch definition");
-    assert!(apply_patch.visibility.is_model_visible());
+    assert!(apply_patch.visibility.is_model_hidden());
     assert_eq!(
         apply_patch.adaptive_runtime_direct_rank(),
         None,
-        "specialized patching should stay ModelVisible but use Adaptive discovery/gateway"
+        "specialized patching is exact-manifest gateway-only"
     );
     assert!(
         derived
             .iter()
-            .any(|definition| definition.name == "apply_text_edits"),
+            .any(|definition| definition.name == "edit_project_files"),
         "canonical ordinary edits must remain adaptive-direct"
     );
 
@@ -667,11 +778,9 @@ fn adaptive_runtime_direct_declarations_are_visible_ranked_and_unique() {
         ("rotate_agent_continuation_endpoint", 19),
         ("import_conversation_files_to_project", 55),
         ("project_artifact", 56),
-        ("transfer_project_artifact", 57),
-        ("run_detached_process", 72),
+        ("run_script", 74),
         ("run_shell", 75),
         ("observe_jobs", 80),
-        ("stop_job", 81),
     ] {
         let definition = derived
             .iter()
@@ -685,6 +794,10 @@ fn adaptive_runtime_direct_declarations_are_visible_ranked_and_unique() {
     }
 
     for name in [
+        "list_jobs",
+        "stop_job",
+        "run_detached_process",
+        "transfer_project_artifact",
         "workspace_hygiene_check",
         "finish_coding_task",
         "runner_config_check",
@@ -694,9 +807,7 @@ fn adaptive_runtime_direct_declarations_are_visible_ranked_and_unique() {
         "session_shell_exec",
         "session_shell_status",
         "close_session_shell",
-        "run_script",
         "attach_agent_endpoint",
-        "apply_patch",
         "save_project_artifact",
         "read_project_artifact",
         "artifact_upload_begin",
@@ -704,6 +815,8 @@ fn adaptive_runtime_direct_declarations_are_visible_ranked_and_unique() {
         "artifact_upload_finish",
         "artifact_upload_abort",
         "go_test",
+        "git_diff_hunks",
+        "git_review_summary",
     ] {
         let definition = lookup_tool_definition(name).expect("model-visible long-tail definition");
         assert!(definition.visibility.is_model_visible(), "{name}");
@@ -716,8 +829,8 @@ fn adaptive_runtime_direct_declarations_are_visible_ranked_and_unique() {
 
     for (name, expected_rank, expected_authority) in [
         ("session_discussion_summary", 15, RUNTIME_READ),
-        ("list_jobs", 85, RUNTIME_READ),
-        ("git_diff_hunks", 125, PROJECT_READ),
+        ("review_changes", 120, PROJECT_READ),
+        ("show_changes", 130, PROJECT_READ),
     ] {
         let definition = derived
             .iter()
@@ -738,78 +851,6 @@ fn adaptive_runtime_direct_declarations_are_visible_ranked_and_unique() {
         );
     }
 
-    let gpt_action_direct = gpt_action_direct_tool_definitions();
-    let expected_gpt_action_direct = derived
-        .iter()
-        .copied()
-        .filter(|definition| {
-            definition.supports_gpt_actions()
-                && definition.gpt_action_exposure() != ToolGptActionExposure::GatewayOnly
-        })
-        .map(|definition| definition.name)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        gpt_action_direct
-            .iter()
-            .map(|definition| definition.name)
-            .collect::<Vec<_>>(),
-        expected_gpt_action_direct,
-        "GPT Actions direct exposure must inherit Adaptive Direct ordering minus definition-owned unsupported/gateway-only exceptions"
-    );
-    assert!(gpt_action_tool_supported("apply_patch"));
-    #[cfg(feature = "experimental-code-mode")]
-    {
-        assert!(gpt_action_tool_supported("code_mode_exec_effectful"));
-        assert!(gpt_action_tool_supported("code_mode_exec_mutating"));
-        for name in ["code_mode_exec_effectful", "code_mode_exec_mutating"] {
-            assert!(
-                !gpt_action_direct
-                    .iter()
-                    .any(|definition| definition.name == name),
-                "{name} must stay GPT-Action-supported behind call_runtime_tool to preserve the OpenAPI operation budget"
-            );
-        }
-    }
-    assert!(
-        !gpt_action_direct
-            .iter()
-            .any(|definition| definition.name == "apply_patch"),
-        "apply_patch stays GPT-Action-supported long-tail behind call_runtime_tool"
-    );
-    for name in [
-        "present_goal_plan",
-        "present_agent_continuation",
-        "present_work_result",
-        "rotate_agent_continuation_endpoint",
-    ] {
-        assert!(
-            !gpt_action_tool_supported(name),
-            "{name} depends on MCP-only presentation/resource semantics"
-        );
-    }
-
-    for definition in &gpt_action_direct {
-        let model_spec = definition
-            .model_spec
-            .expect("model-visible direct tool spec");
-        let action_description = definition
-            .gpt_action_description()
-            .expect("GPT Action description projection");
-        assert!(
-            action_description.chars().count() <= GPT_ACTION_DESCRIPTION_MAX_CHARS,
-            "{} GPT Action description exceeds {} characters",
-            definition.name,
-            GPT_ACTION_DESCRIPTION_MAX_CHARS
-        );
-        if model_spec.description.chars().count() > GPT_ACTION_DESCRIPTION_MAX_CHARS {
-            assert!(
-                model_spec.gpt_action_description.is_some(),
-                "{} needs an explicit short GPT Action presentation description",
-                definition.name
-            );
-        }
-    }
-
     let observe_jobs = registered_tool_specs()
         .into_iter()
         .find(|spec| spec.name == "observe_jobs")
@@ -828,14 +869,236 @@ fn adaptive_runtime_direct_declarations_are_visible_ranked_and_unique() {
         .contains("Recovery and inventory primitive"));
     assert!(list_jobs
         .description
-        .contains("continue that Job with observe_jobs"));
+        .contains("retain that continuation and continue independent work"));
+    assert!(list_jobs
+        .description
+        .contains("using observe_jobs only when logs/details/recovery are needed"));
 
     let git_review = registered_tool_specs()
         .into_iter()
         .find(|spec| spec.name == "git_review_summary")
         .expect("git_review_summary ToolSpec");
-    assert!(git_review.description.contains("git_diff_hunks/read_files"));
-    assert!(!git_review.description.contains("git_diff_hunks/read_file "));
+    assert!(git_review
+        .description
+        .contains("Specialist exact committed-range review map"));
+    assert!(git_review
+        .description
+        .contains("Ordinary review uses review_changes"));
+}
+
+#[cfg(feature = "legacy-gpt-actions")]
+#[test]
+fn legacy_gpt_action_surface_is_frozen() {
+    let direct = gpt_action_direct_tool_definitions();
+    assert_eq!(
+        direct
+            .iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>(),
+        LEGACY_GPT_ACTION_DIRECT_TOOL_NAMES
+    );
+
+    for name in LEGACY_GPT_ACTION_SUPPORTED_TOOL_NAMES {
+        let definition = lookup_tool_definition(name)
+            .unwrap_or_else(|| panic!("frozen GPT Action tool {name} disappeared"));
+        assert!(
+            definition.gpt_action_exposure() != ToolGptActionExposure::Unsupported,
+            "frozen GPT Action tool {name} became unsupported"
+        );
+        assert!(gpt_action_tool_supported(name), "{name}");
+    }
+
+    for specialist in EXACT_MANIFEST_SPECIALIST_TOOL_NAMES {
+        assert!(
+            gpt_action_tool_supported(specialist),
+            "{specialist} must remain legacy GPT-Action gateway-callable"
+        );
+    }
+
+    for definition in &direct {
+        let model_spec = definition
+            .model_spec
+            .expect("legacy direct GPT Action must remain model-visible");
+        let action_description = definition
+            .gpt_action_description()
+            .expect("GPT Action description projection");
+        assert!(
+            action_description.chars().count() <= GPT_ACTION_DESCRIPTION_MAX_CHARS,
+            "{} GPT Action description exceeds {} characters",
+            definition.name,
+            GPT_ACTION_DESCRIPTION_MAX_CHARS
+        );
+        if model_spec.description.chars().count() > GPT_ACTION_DESCRIPTION_MAX_CHARS {
+            assert!(
+                model_spec.gpt_action_description.is_some(),
+                "{} needs an explicit short GPT Action presentation description",
+                definition.name
+            );
+        }
+    }
+
+    for name in [
+        "present_goal_plan",
+        "present_agent_continuation",
+        "present_work_result",
+        "rotate_agent_continuation_endpoint",
+    ] {
+        assert!(
+            !gpt_action_tool_supported(name),
+            "{name} depends on MCP-only presentation/resource semantics"
+        );
+    }
+
+    #[cfg(feature = "experimental-code-mode")]
+    for name in [
+        "code_mode_exec",
+        "code_mode_exec_effectful",
+        "code_mode_exec_mutating",
+    ] {
+        assert!(
+            !gpt_action_tool_supported(name),
+            "{name} must not enter the frozen legacy GPT Action snapshot"
+        );
+    }
+}
+
+#[test]
+fn turn_economy_descriptors_stay_converged_and_bounded() {
+    let specs = registered_tool_specs();
+
+    for name in ["run_process", "run_script", "run_shell"] {
+        let spec = spec_named(&specs, name);
+        for phrase in [
+            "continue independent work",
+            "observe_jobs only for",
+            "wait_for_job_terminal only when",
+        ] {
+            assert!(spec.description.contains(phrase), "{name}: {phrase}");
+        }
+        assert!(
+            !spec.description.contains("Use observe_jobs later"),
+            "{name}"
+        );
+        #[cfg(feature = "legacy-gpt-actions")]
+        {
+            let action = lookup_tool_definition(name)
+                .unwrap()
+                .gpt_action_description()
+                .expect("execution action description");
+            assert!(!action.contains("Use observe_jobs later"), "{name}");
+        }
+        assert!(
+            spec.description.contains("sparse terminal Job attention"),
+            "{name}"
+        );
+    }
+
+    for name in ["cargo_check", "cargo_test"] {
+        let spec = spec_named(&specs, name);
+        for phrase in [
+            "continue independent work",
+            "do not poll",
+            "covered source",
+            "final evidence freeze covered source",
+        ] {
+            assert!(spec.description.contains(phrase), "{name}: {phrase}");
+        }
+    }
+    let cargo_fmt = spec_named(&specs, "cargo_fmt");
+    for phrase in [
+        "continue independent work",
+        "do not poll",
+        "evidence is stale",
+        "freeze covered source",
+    ] {
+        assert!(
+            cargo_fmt.description.contains(phrase),
+            "cargo_fmt: {phrase}"
+        );
+    }
+
+    let observe = spec_named(&specs, "observe_jobs");
+    for phrase in [
+        "logs/details/recovery",
+        "not the default follow-up to execution_state=pending",
+        "Never launches, retries",
+    ] {
+        assert!(
+            observe.description.contains(phrase),
+            "observe_jobs: {phrase}"
+        );
+    }
+    let wait = spec_named(&specs, "wait_for_job_terminal");
+    assert!(wait
+        .description
+        .contains("only when no independent work remains"));
+    assert!(wait
+        .description
+        .contains("explicit logs/details or recovery"));
+    let list = spec_named(&specs, "list_jobs");
+    assert!(list
+        .description
+        .contains("Recovery and inventory primitive"));
+    assert!(list
+        .description
+        .contains("not the normal continuation step"));
+    assert!(list
+        .description
+        .contains("retain that continuation and continue independent work"));
+    assert!(list
+        .description
+        .contains("observe_jobs only when logs/details/recovery are needed"));
+
+    let edits = spec_named(&specs, "edit_project_files");
+    for phrase in [
+        "read_files",
+        "expected_read_revision",
+        "Exact edits fail closed on ambiguity",
+        "replace_range",
+        "same original snapshot",
+        "preflighted transactionally",
+        "dry_run",
+        "show_changes",
+        "structured validation",
+        "outcome_unknown",
+    ] {
+        assert!(
+            edits.description.contains(phrase),
+            "edit_project_files: {phrase}"
+        );
+    }
+    assert!(spec_named(&specs, "cargo_check")
+        .description
+        .contains("packages for a known set"));
+
+    for name in [
+        "run_process",
+        "run_script",
+        "run_shell",
+        "observe_jobs",
+        "wait_for_job_terminal",
+        "list_jobs",
+        "cargo_check",
+        "cargo_test",
+        "edit_project_files",
+    ] {
+        let spec = spec_named(&specs, name);
+        assert!(
+            spec.description.chars().count() <= MODEL_TOOL_DESCRIPTION_MAX_CHARS,
+            "{name} canonical description budget"
+        );
+        #[cfg(feature = "legacy-gpt-actions")]
+        {
+            let action = lookup_tool_definition(name)
+                .unwrap()
+                .gpt_action_description()
+                .expect("model-facing action description");
+            assert!(
+                action.chars().count() <= GPT_ACTION_DESCRIPTION_MAX_CHARS,
+                "{name} GPT Action description budget"
+            );
+        }
+    }
 }
 
 #[test]
@@ -999,19 +1262,22 @@ fn run_skill_resource_contract_distinguishes_live_configured_and_managed_fences(
             "run_skill_resource ToolDefinition must describe {phrase:?}: {model_description}"
         );
     }
-    let action_description = definition
-        .gpt_action_description()
-        .expect("run_skill_resource GPT Action description")
-        .to_ascii_lowercase();
-    for phrase in [
-        "configured skills are live",
-        "expected_definition_revision",
-        "managed skills additionally require expected_package_revision",
-    ] {
-        assert!(
-            action_description.contains(phrase),
-            "run_skill_resource GPT Action description must describe {phrase:?}: {action_description}"
-        );
+    #[cfg(feature = "legacy-gpt-actions")]
+    {
+        let action_description = definition
+            .gpt_action_description()
+            .expect("run_skill_resource GPT Action description")
+            .to_ascii_lowercase();
+        for phrase in [
+            "configured skills are live",
+            "expected_definition_revision",
+            "managed skills additionally require expected_package_revision",
+        ] {
+            assert!(
+                action_description.contains(phrase),
+                "run_skill_resource GPT Action description must describe {phrase:?}: {action_description}"
+            );
+        }
     }
 }
 
@@ -1025,7 +1291,7 @@ fn code_mode_discovery_ranks_inspection_before_specialized_effects_without_chang
             .unwrap()
     };
     assert!(position("code_mode_exec") < position("code_mode_exec_mutating"));
-    assert!(position("apply_text_edits") < position("code_mode_exec_mutating"));
+    assert!(position("edit_project_files") < position("code_mode_exec_mutating"));
     assert!(position("code_mode_exec") < position("code_mode_exec_effectful"));
     assert!(position("cargo_test") < position("code_mode_exec_effectful"));
     for (name, group) in [

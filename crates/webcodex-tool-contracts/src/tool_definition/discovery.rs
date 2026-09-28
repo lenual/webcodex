@@ -168,11 +168,41 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             .with_activity(
                 super::ToolActivityPresentation::Support,
                 super::ToolActivityInteraction::NonMeaningful,
+            )
+            .with_host_orchestration_hint(
+                super::ToolHostOrchestrationHint::independent_parallel_read(),
             ),
-            "Read runtime status; pass exact client_id for one Runner deployment/source alignment, omit for fleet-wide. Reports shared Job concurrency; global mode includes bounded host_context advisory metadata, never authority.",
-        ),
+            "Read runtime health and protocol/build/source alignment; exact client_id focuses one Runner and its Job concurrency. compact=true or summary_only=true selects sparse counts without inventories. Canonical/API default is full diagnostics with capabilities, build, authority, configuration and connection details; MCP defaults to sparse and accepts compact=false for diagnostics.",
+        ).with_gpt_action_description("Read fleet or exact client_id Runner health and protocol/build/source alignment. compact=true returns sparse counts; omit for full diagnostic inventories and configuration."),
         20,
     ),
+    model_spec(
+            def(
+                "current_window_activity",
+                super::ToolAuditPolicy::TYPED_CANONICAL,
+                ModelVisible,
+                TOOL_CATEGORY_RUNTIME,
+                None,
+                TOOL_PROVIDER_CONTROL,
+                super::ToolSemanticContract {
+                    effect: super::ToolEffect::Observe,
+                    risk: Read,
+                    approval: super::ToolApprovalPolicy::None,
+                    idempotency: super::ToolIdempotency::PureRead,
+                },
+                Some(RUNTIME_READ),
+                false,
+                NoPath,
+                false,
+                false,
+                super::ToolSessionEvidencePolicy::NONE,
+            )
+            .with_activity(
+                super::ToolActivityPresentation::Support,
+                super::ToolActivityInteraction::NonMeaningful,
+            ),
+            "Read bounded sanitized ActionAudit activity only for the current Host Window from transport identity. Requires runtime:read; every event retains current Project and principal visibility checks. No window selector, arguments, output, credentials, paths, or Host/model-state diagnosis. response_handed_at_ms means WebCodex constructed the response and handed it to the HTTP framework or returned from the handler; it does not prove downstream receipt. next_call_gap_ms exists only when a later canonical event was observed. Summary gap threshold counts are cumulative and, with totals, are descriptive WebCodex-observed request timing only; short gaps never prove Host cells, model turns, model thinking, frontend/network/user delay, or MCP orchestration. overlapping_call_count counts only persisted window_transition_kind=overlap and is never inferred from gap duration.",
+        ),
     adaptive_runtime_direct(
         model_spec(
             def(

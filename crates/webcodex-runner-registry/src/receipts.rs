@@ -104,6 +104,12 @@ impl ReceiptRegistryState {
         self.state.try_lock().is_ok()
     }
 
+    /// A nonblocking immutable observation has no receipt/event effects.
+    pub(crate) fn try_read<T>(&self, read: impl FnOnce(&RunnerRegistryInner) -> T) -> Option<T> {
+        let guard = self.state.try_lock().ok()?;
+        Some(read(&guard))
+    }
+
     pub(crate) async fn lock(&self) -> ReceiptRegistryGuard<'_> {
         ReceiptRegistryGuard {
             guard: Some(self.state.lock().await),
@@ -145,10 +151,18 @@ impl Drop for ReceiptRegistryGuard<'_> {
         drop(self.guard.take());
         if let Some(store) = &self.state.store {
             let mut failed = 0;
+            let mut retry_ids = Vec::new();
             for receipt in receipts {
                 if store.upsert(&receipt).is_err() {
                     failed += 1;
+                    retry_ids.push(receipt.snapshot.job_id);
                 }
+            }
+            if !retry_ids.is_empty() {
+                // Retry only persistence on a later registry unlock, never the
+                // original Job. The existing candidate set deduplicates retries;
+                // expired or removed Jobs are discarded by capture above.
+                self.state.candidates.lock().unwrap().extend(retry_ids);
             }
             if failed > 0 {
                 // Never log adapter errors or payloads: they may contain SQL data.

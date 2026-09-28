@@ -39,13 +39,14 @@ fn structured_execution_output(
     });
     if promoted_to_job {
         instance["output"]["continuation"] = serde_json::json!({
+            "follow_up_kind": "fallback_recovery",
             "tool": "observe_jobs",
             "arguments": {
                 "items": [{
                     "job_id": job_id.expect("promoted Job id"),
                     "after_observation_token": "observation"
                 }],
-                "wait_secs": webcodex_core::runtime_contract::MODEL_JOB_CONTINUATION_WAIT_SECS,
+                "wait_secs": webcodex_core::runtime_contract::DEFAULT_JOB_CONTINUATION_WAIT_SECS,
                 "wake_on": "terminal"
             }
         });
@@ -64,7 +65,25 @@ fn structured_execution_output(
 
 #[test]
 fn suggested_tool_call_schema_recognizer_is_strict_and_structural() {
+    let valid_generated = json!({
+        "follow_up_kind": "mechanically_followable",
+        "tool": "read_files",
+        "arguments": {
+            "project": "agent:test:demo",
+            "items": [{"path": "src/lib.rs"}]
+        }
+    });
+    test_support::validate_generated_tool_call_against_registered_input_schema(&valid_generated)
+        .expect("generated read_files follow-up must pass the current registered inputSchema");
+    let mut host_rejected = valid_generated.clone();
+    host_rejected["arguments"]["unsupported_host_field"] = json!(true);
+    let error =
+        test_support::validate_generated_tool_call_against_registered_input_schema(&host_rejected)
+            .expect_err("registered Host schema must reject generated arguments with drift");
+    assert!(error.contains("registered inputSchema"), "{error}");
+
     let canonical = suggested_tool_call_schema(
+        webcodex_core::runtime_contract::GeneratedFollowUpKind::MechanicallyFollowable,
         "git_log",
         json!({"type": "object", "additionalProperties": false, "properties": {}}),
         "next page",
@@ -72,6 +91,10 @@ fn suggested_tool_call_schema_recognizer_is_strict_and_structural() {
     assert_eq!(
         suggested_tool_call_schema_target(&canonical),
         Some("git_log")
+    );
+    assert_eq!(
+        canonical["properties"]["follow_up_kind"]["const"],
+        "mechanically_followable"
     );
 
     let incidental = json!({
@@ -96,6 +119,124 @@ fn suggested_tool_call_schema_recognizer_is_strict_and_structural() {
         "required": ["tool", "arguments"]
     });
     assert_eq!(suggested_tool_call_schema_target(&open_object), None);
+}
+
+#[test]
+fn registered_generated_next_step_schemas_declare_host_execution_posture() {
+    fn inspect_call_shapes(
+        schema: &serde_json::Value,
+        path: &str,
+        count: &mut usize,
+        failures: &mut Vec<String>,
+    ) {
+        match schema {
+            serde_json::Value::Object(object) => {
+                if let Some(properties) = object
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                {
+                    if properties.contains_key("tool") && properties.contains_key("arguments") {
+                        *count += 1;
+                        let posture = properties
+                            .get("follow_up_kind")
+                            .and_then(|field| field.get("const"))
+                            .and_then(serde_json::Value::as_str);
+                        if !posture.is_some_and(|value| {
+                            webcodex_core::runtime_contract::GENERATED_FOLLOW_UP_KIND_VALUES
+                                .contains(&value)
+                        }) {
+                            failures.push(format!(
+                                "{path}: generated tool-call schema is missing a canonical follow_up_kind const"
+                            ));
+                        }
+                        let required_has_posture = object
+                            .get("required")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|required| {
+                                required
+                                    .iter()
+                                    .any(|field| field.as_str() == Some("follow_up_kind"))
+                            });
+                        if !required_has_posture {
+                            failures.push(format!(
+                                "{path}: generated tool-call schema does not require follow_up_kind"
+                            ));
+                        }
+                    }
+                }
+                for (key, child) in object {
+                    inspect_call_shapes(child, &format!("{path}.{key}"), count, failures);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    inspect_call_shapes(child, &format!("{path}[{index}]"), count, failures);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_generated_edges(
+        schema: &serde_json::Value,
+        path: &str,
+        in_recovery: bool,
+        count: &mut usize,
+        failures: &mut Vec<String>,
+    ) {
+        match schema {
+            serde_json::Value::Object(object) => {
+                for (key, child) in object {
+                    let child_path = format!("{path}.{key}");
+                    let recovery = in_recovery || key == "recovery";
+                    if matches!(
+                        key.as_str(),
+                        "next_call" | "suggested_call" | "continuation"
+                    ) || recovery
+                    {
+                        inspect_call_shapes(child, &child_path, count, failures);
+                    } else {
+                        visit_generated_edges(child, &child_path, recovery, count, failures);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    visit_generated_edges(
+                        child,
+                        &format!("{path}[{index}]"),
+                        in_recovery,
+                        count,
+                        failures,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let specs = registered_tool_specs();
+    let mut count = 0;
+    let mut failures = Vec::new();
+    for spec in &specs {
+        visit_generated_edges(
+            &spec.output_schema,
+            &spec.name,
+            false,
+            &mut count,
+            &mut failures,
+        );
+    }
+
+    assert!(
+        count >= 10,
+        "generated next-step schema audit unexpectedly covered only {count} call shapes"
+    );
+    assert!(
+        failures.is_empty(),
+        "registered generated next-step schemas must expose explicit Host execution posture:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[test]
@@ -183,7 +324,7 @@ fn git_diff_hunks_recovery_schema_accepts_only_sparse_actionable_lanes() {
     });
     let refine = json!({"current_hunk": {
         "reason_code": "larger_max_hunk_lines_available",
-        "next_call": {"tool": "git_diff_hunks", "arguments": arguments}
+        "next_call": {"follow_up_kind": "mechanically_followable", "tool": "git_diff_hunks", "arguments": arguments}
     }});
     test_support::validate_schema_instance(&refine, schema).unwrap();
     let mut fragment = refine.clone();
@@ -313,6 +454,7 @@ fn search_batch_omitted_summary_schema_is_bounded_and_content_free() {
                 {"index": 3, "success": false, "reason_code": "timeout", "failure_stage": "agent_transport", "detail_code": "timeout"}
             ],
             "suggested_call": {
+                "follow_up_kind": "mechanically_followable",
                 "tool": "search_project_texts",
                 "arguments": {
                     "project": "agent:oe:demo",
@@ -448,6 +590,15 @@ fn agent_identity_listing_readiness_schema_is_sparse_and_non_authoritative() {
         .unwrap()
         .iter()
         .any(|field| field == "production_auto_resume_available"));
+    assert!(agent["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field == "agent_continuation_ref"));
+    assert_eq!(
+        properties["agent_continuation_ref"]["anyOf"][0]["pattern"],
+        crate::AGENT_CONTINUATION_REF_PATTERN
+    );
     for forbidden in [
         "client_window",
         "client_window_key",
@@ -506,6 +657,34 @@ fn job_terminal_continuation_output_schemas_are_sparse_and_private_app_payload_i
 }
 
 #[test]
+fn start_agent_task_attempt_schema_returns_ref_without_replacing_fence() {
+    let schema = output_schema_for_tool("start_agent_task_attempt");
+    let properties = schema["properties"]["output"]["properties"]
+        .as_object()
+        .unwrap();
+    assert!(properties.contains_key("attempt_fence"));
+    assert!(properties.contains_key("attempt_ref"));
+    assert!(properties["attempt_ref"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("Not a credential"));
+    let read = output_schema_for_tool("read_agent_task");
+    let summary = &read["properties"]["output"]["properties"]["task"]["properties"]["summary"];
+    let summary_properties = summary["properties"].as_object().unwrap();
+    assert!(summary_properties.contains_key("attempt_ref"));
+    assert!(!summary["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field == "attempt_ref"));
+    assert!(!summary_properties.contains_key("attempt_fence"));
+    let latest_attempt = &summary_properties["latest_attempt"]["anyOf"][0];
+    let read_properties = latest_attempt["properties"].as_object().unwrap();
+    assert!(!read_properties.contains_key("attempt_ref"));
+    assert!(!read_properties.contains_key("attempt_fence"));
+}
+
+#[test]
 fn generic_agent_task_read_schema_never_exposes_attempt_fence_or_active_turn_token() {
     let schema = output_schema_for_tool("read_agent_task");
     let latest_attempt = &schema["properties"]["output"]["properties"]["task"]["properties"]
@@ -525,10 +704,10 @@ fn generic_agent_task_read_schema_never_exposes_attempt_fence_or_active_turn_tok
 }
 
 #[test]
-fn goal_plan_activity_schema_is_bounded_soft_and_payload_free() {
+fn goal_plan_observability_schema_is_bounded_soft_and_payload_free() {
     let schema = output_schema_for_tool("present_goal_plan");
     let plan = &schema["properties"]["output"]["properties"]["goal_plan"];
-    assert_eq!(plan["properties"]["version"]["const"], 1);
+    assert_eq!(plan["properties"]["version"]["const"], 3);
     assert!(plan["required"]
         .as_array()
         .unwrap()
@@ -558,18 +737,66 @@ fn goal_plan_activity_schema_is_bounded_soft_and_payload_free() {
         .find(|variant| variant["type"] == "integer")
         .unwrap();
     assert_eq!(active["maximum"], 64);
-    let encoded = activity.to_string();
+    assert!(plan["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field == "continuity"));
+    let continuity = &plan["properties"]["continuity"];
+    assert_eq!(continuity["additionalProperties"], false);
+    assert_eq!(
+        continuity["properties"]["state"]["enum"],
+        json!([
+            "ready",
+            "stalled",
+            "wake_queued",
+            "dispatching",
+            "host_accepted",
+            "host_unknown",
+            "resume_confirmed",
+            "not_configured",
+            "not_applicable",
+            "unavailable"
+        ])
+    );
+    assert_eq!(
+        continuity["properties"]["host_delivery"]["enum"],
+        json!([
+            "not_started",
+            "dispatching",
+            "accepted",
+            "unknown",
+            "not_confirmed",
+            "not_applicable"
+        ])
+    );
+    assert_eq!(
+        continuity["properties"]["fresh_turn"]["enum"],
+        json!(["not_confirmed", "confirmed", "not_applicable"])
+    );
+    let plan_properties = plan["properties"].as_object().unwrap();
+    let continuity_properties = continuity["properties"].as_object().unwrap();
     for forbidden in [
         "client_window_key",
         "openai/session",
         "tool_arguments",
         "tool_outputs",
+        "wake_id",
+        "wake_attempt_id",
+        "endpoint_id",
+        "binding_id",
+        "principal_id",
+        "principal_digest",
+        "project_path",
         "attempt_fence",
         "consume_token",
+        "stdout",
+        "stderr",
     ] {
         assert!(
-            !encoded.contains(forbidden),
-            "activity schema leaked {forbidden}"
+            !plan_properties.contains_key(forbidden)
+                && !continuity_properties.contains_key(forbidden),
+            "Goal Plan observability schema exposed {forbidden} as a field"
         );
     }
 }
@@ -851,7 +1078,7 @@ fn observe_jobs_failure_item_schema_closes_recovery_metadata() {
                 "success": false,
                 "output": null,
                 "error_kind": "unknown_job",
-                "suggested_call": {"tool": "list_jobs", "arguments": {}},
+                "suggested_call": {"follow_up_kind": "fallback_recovery", "tool": "list_jobs", "arguments": {}},
                 "error": "unknown job"
             }],
             "wait": {
@@ -895,7 +1122,7 @@ fn read_continuation_output_schemas_accept_one_action_and_snapshot_truth() {
                 "read_revision": 3817291045227_u64, "start_line": 1, "limit": 100, "total_lines": 200,
                 "returned_lines": 50, "end_line": 50, "has_more": true, "budget_truncated": true}}],
         "output_truncated": true, "truncation_reason": "batch_response_budget",
-        "suggested_call": {"tool": "read_files", "arguments": {"project": "agent:oe:demo", "session_id": "wc_sess_abcdefghijklmnop",
+        "suggested_call": {"follow_up_kind": "mechanically_followable", "tool": "read_files", "arguments": {"project": "agent:oe:demo", "session_id": "wc_sess_abcdefghijklmnop",
             "items": [{"path": "src/0.rs", "start_line": 51, "limit": 50, "expected_read_revision": 3817291045227_u64}, {"path": "src/1.rs"}, {"path": "src/2.rs", "start_line": 4, "limit": 20}]}}
     }});
     test_support::validate_schema_instance(&result, &schema).unwrap();
@@ -1059,6 +1286,7 @@ fn key_tool_output_schemas_include_expected_fields() {
             "outcome_unknown",
             "completed",
             "timed_out",
+            "pending",
             "queued",
             "running"
         ])
@@ -1223,7 +1451,14 @@ fn key_tool_output_schemas_include_expected_fields() {
     }
     assert_eq!(
         output_schema_property(&specs, "run_script", "language")["enum"],
-        serde_json::json!(["sh", "bash", "powershell", "javascript", "typescript"])
+        serde_json::json!([
+            "sh",
+            "bash",
+            "powershell",
+            "python",
+            "javascript",
+            "typescript"
+        ])
     );
     assert_eq!(
         output_schema_property(&specs, "run_script", "execution_source")["const"],
@@ -1496,8 +1731,13 @@ fn key_tool_output_schemas_include_expected_fields() {
             webcodex_core::runtime_contract::MAX_JOB_OBSERVATION_WAIT_SECS
         );
         assert_eq!(
-            continuation["properties"]["arguments"]["properties"]["wait_secs"]["const"],
-            webcodex_core::runtime_contract::MODEL_JOB_CONTINUATION_WAIT_SECS
+            continuation["properties"]["arguments"]["properties"]["wait_secs"]["minimum"],
+            1
+        );
+        assert!(
+            continuation["properties"]["arguments"]["properties"]["wait_secs"]
+                .get("const")
+                .is_none()
         );
         assert_eq!(
             continuation["properties"]["arguments"]["properties"]["wake_on"]["const"],
@@ -1507,6 +1747,27 @@ fn key_tool_output_schemas_include_expected_fields() {
             .as_array()
             .unwrap()
             .contains(&serde_json::json!("wake_on")));
+        let pending_strategy = output_schema_property(&specs, name, "pending_strategy");
+        assert_eq!(
+            pending_strategy["properties"]["default"]["const"],
+            "continue_independent_work"
+        );
+        assert_eq!(
+            pending_strategy["properties"]["passive_terminal_attention"]["const"],
+            "same_scope_may_surface"
+        );
+        assert_eq!(
+            pending_strategy["properties"]["observe_continuation"]["const"],
+            "logs_details_recovery_fallback"
+        );
+        assert_eq!(
+            pending_strategy["properties"]["observe_auto_follow"]["const"],
+            false
+        );
+        assert_eq!(
+            pending_strategy["properties"]["blocked_fallback"]["const"],
+            "wait_for_job_terminal"
+        );
         assert!(
             has_output_field(name, "failure_kind"),
             "{name} missing failure_kind"
@@ -1527,12 +1788,11 @@ fn key_tool_output_schemas_include_expected_fields() {
             .as_str()
             .expect("cargo execution_state description");
         for state in [
+            "pending",
             "not_started",
             "outcome_unknown",
             "completed",
             "timed_out",
-            "queued",
-            "running",
         ] {
             assert!(
                 state_description.contains(state),
@@ -1851,7 +2111,7 @@ fn key_tool_output_schemas_include_expected_fields() {
         "auth_enabled",
         "configured_public_url",
         "effective_config",
-        "agents",
+        "runners",
         "projects",
         "jobs",
         "tools",
@@ -1862,6 +2122,13 @@ fn key_tool_output_schemas_include_expected_fields() {
             has_output_field("runtime_status", field),
             "runtime_status missing {field}"
         );
+    }
+    assert!(!has_output_field("runtime_status", "agents"));
+    for field in ["runners", "summary", "count"] {
+        assert!(has_output_field("list_runners", field));
+    }
+    for legacy in ["agents", "clients"] {
+        assert!(!has_output_field("list_runners", legacy));
     }
     for field in ["projects", "count", "recommended_for_smoke"] {
         assert!(
@@ -2071,7 +2338,7 @@ fn cleanup_output_schemas_describe_result_metadata_only() {
 
 #[test]
 fn write_project_file_output_schema_include_metadata_fields() {
-    let specs = registered_tool_specs();
+    let specs = exact_manifest_specialist_tool_specs();
 
     // The removed legacy edit tools (`replace_in_file` and friends) are no
     // longer known tools, so they have no public ToolSpec/output schema.
@@ -2125,7 +2392,8 @@ fn write_project_file_output_schema_include_metadata_fields() {
 
 #[test]
 fn cleanup_and_compatibility_write_output_schemas_do_not_advertise_broad_exfiltration() {
-    let specs = registered_tool_specs();
+    let mut specs = registered_tool_specs();
+    specs.extend(exact_manifest_specialist_tool_specs());
 
     for tool in [
         "git_restore_paths",
@@ -2236,6 +2504,7 @@ fn computer_recovery_output_schemas_use_canonical_action_shapes() {
         "success": false,
         "output": {
             "suggested_call": {
+                "follow_up_kind": "fallback_recovery",
                 "tool": "computer_observe",
                 "arguments": {"action": "windows", "client_id": "special"}
             }
@@ -2291,6 +2560,7 @@ fn skill_recovery_output_schema_accepts_canonical_shapes_and_declares_legacy_rej
             "outcome_unknown": true,
             "state_changed": null,
             "suggested_call": {
+                "follow_up_kind": "fallback_recovery",
                 "tool": "skill_versions",
                 "arguments": {
                     "project": "agent:test:demo",
@@ -2352,6 +2622,112 @@ fn default_output_schema_field_names() -> BTreeSet<&'static str> {
 }
 
 #[test]
+fn model_visible_output_schemas_admit_bounded_passive_job_attention() {
+    let attention = json!({
+        "changed": true,
+        "items": [{
+            "job_id": "wc_job_schema",
+            "tool": "cargo_test",
+            "status": "completed",
+            "state": "terminal",
+            "outcome": "passed",
+            "exit_code": 0,
+            "command_ok": true,
+            "validation": {
+                "tool": "cargo_test",
+                "kind": "test",
+                "state": "completed",
+                "passed": null,
+                "source_state": {
+                    "freshness": "unproven",
+                    "observed_mutation_fence": "unknown"
+                }
+            },
+            "details": {
+                "follow_up_kind": "fallback_recovery",
+                "tool": "observe_jobs",
+                "arguments": {"items": [{"job_id": "wc_job_schema"}]}
+            }
+        }]
+    });
+    let specs = registered_tool_specs();
+    for spec in &specs {
+        let fields = output_schema_field_names(spec);
+        assert_eq!(
+            fields.contains("job_attention"),
+            runtime_tool_supports_passive_job_attention(&spec.name),
+            "{} passive-attention schema eligibility must match canonical runtime policy",
+            spec.name
+        );
+    }
+
+    let cargo_check = spec_named(&specs, "cargo_check");
+    let field = cargo_check.output_schema["properties"]["output"]["properties"]
+        .get("job_attention")
+        .expect("cargo_check must declare passive job_attention");
+    test_support::validate_schema_instance(&attention, field)
+        .expect("cargo_check passive job_attention shape must validate");
+    let pending = json!({
+        "success": true,
+        "output": {
+            "execution_state": "pending",
+            "pending_strategy": {
+                "default": "continue_independent_work",
+                "passive_terminal_attention": "same_scope_may_surface",
+                "observe_continuation": "logs_details_recovery_fallback",
+                "observe_auto_follow": false,
+                "blocked_fallback": "wait_for_job_terminal"
+            },
+            "continuation": {
+                "follow_up_kind": "fallback_recovery",
+                "tool": "observe_jobs",
+                "arguments": {
+                    "items": [{"job_id": "wc_job_pending", "after_observation_token": "wj3_AAAAAAAAAAAAAAAAAAAAAA.1.0.0"}],
+                    "wait_secs": 5,
+                    "wake_on": "terminal"
+                }
+            },
+            "job_attention": attention
+        },
+        "error": null
+    });
+    test_support::validate_schema_instance(&pending, &cargo_check.output_schema)
+        .expect("strict cargo_check output must admit the generic passive sidecar");
+}
+
+#[test]
+fn passive_failure_diagnostics_schema_rejects_overflow_and_private_fields() {
+    let schema = output_schema_for_tool("cargo_check");
+    let field = &schema["properties"]["output"]["properties"]["job_attention"]["properties"]
+        ["items"]["items"]["properties"]["validation"]["properties"]["diagnostics"];
+    let safe = json!({"available": true, "diagnostic_count": 1,
+        "diagnostics": [{"severity": "error", "code": "E0308", "file": "src/foo.rs", "line": 123, "column": 9, "message": "expected X, found Y"}],
+        "returned_diagnostic_count": 1, "diagnostics_truncated": false,
+        "failed_test_details": [], "failed_test_details_truncated": false});
+    test_support::validate_schema_instance(&safe, field).unwrap();
+    let mut overflow = safe.clone();
+    overflow["diagnostics"] = json!(vec![safe["diagnostics"][0].clone(); 4]);
+    assert!(test_support::validate_schema_instance(&overflow, field).is_err());
+    for key in [
+        "stdout",
+        "stderr",
+        "command",
+        "argv",
+        "cwd",
+        "env",
+        "observation_token",
+        "provider_payload",
+    ] {
+        let mut leak = safe.clone();
+        leak[key] = json!("private");
+        assert!(
+            test_support::validate_schema_instance(&leak, field).is_err(),
+            "{key}"
+        );
+    }
+}
+
+#[test]
 fn model_facing_output_schemas_do_not_publish_retired_recovery_tool() {
     for spec in registered_tool_specs() {
         let serialized = serde_json::to_string(&spec.output_schema).unwrap();
@@ -2377,18 +2753,20 @@ fn model_facing_output_schemas_do_not_publish_recorder_only_telemetry() {
         }
     }
 
-    for tool in [
-        "read_files",
-        "search_project_texts",
-        "apply_patch",
-        "cargo_check",
-    ] {
+    for tool in ["read_files", "search_project_texts", "cargo_check"] {
         let fields = output_schema_field_names(spec_named(&specs, tool));
         assert!(
             !fields.contains("session_id"),
             "{tool} still publishes synthetic recorder session_id"
         );
     }
+
+    let specialist_specs = exact_manifest_specialist_tool_specs();
+    let patch_fields = output_schema_field_names(spec_named(&specialist_specs, "apply_patch"));
+    assert!(
+        !patch_fields.contains("session_id"),
+        "apply_patch still publishes synthetic recorder session_id"
+    );
 
     assert!(
         output_schema_field_names(spec_named(&specs, "update_session_context"))
@@ -2903,16 +3281,18 @@ fn agent_wait_model_schema_preserves_bounded_join_sources_without_private_bookke
 }
 
 #[test]
-fn run_process_shell_recovery_schema_is_optional_and_failure_only() {
+fn run_process_shell_normalization_schema_is_success_only_and_payload_free() {
     let specs = registered_tool_specs();
     let spec = spec_named(&specs, "run_process");
-    let suggested = json!({"tool":"run_shell", "arguments":{"project":"demo","shell":"bash","command":"echo hello"}});
-    let failure = json!({"success":false,"output":{"command_started":false,
-        "command_completed":false,"execution_state":"not_started","failure_kind":"invalid_arguments",
-        "suggested_call":suggested},"error":"shell command mode rejected"});
-    test_support::validate_schema_instance(&failure, &spec.output_schema).unwrap();
-    let success = json!({"success":true,"output":{"suggested_call":suggested},"error":null});
-    assert!(test_support::validate_schema_instance(&success, &spec.output_schema).is_err());
+    let normalized = json!({"success":true,"output":{
+        "requested_surface":"run_process", "execution_source":"run_shell",
+        "input_normalization":{"code":"run_process_bash_c_to_run_shell",
+            "hint":"normalized run_process bash -c → run_shell"}
+    },"error":null});
+    test_support::validate_schema_instance(&normalized, &spec.output_schema).unwrap();
+    let mut invalid = normalized;
+    invalid["output"]["input_normalization"]["command"] = json!("private command");
+    assert!(test_support::validate_schema_instance(&invalid, &spec.output_schema).is_err());
 }
 
 #[test]
@@ -2959,4 +3339,148 @@ fn run_skill_resource_success_requires_provenance_and_keeps_lifecycle_constraint
         test_support::validate_schema_instance(&contradictory_lifecycle, schema).is_err(),
         "run_skill_resource must retain structured execution lifecycle constraints"
     );
+}
+
+#[test]
+fn browser_observation_schema_accepts_canonical_runner_output_and_rejects_private_ids() {
+    let observe = crate::output_schema_for_tool("browser_observe");
+    let act = crate::output_schema_for_tool("browser_act");
+    let observe_ok = |output: Value| {
+        test_support::validate_schema_instance(
+            &json!({"success": true, "output": output, "error": null}),
+            &observe,
+        )
+    };
+    let act_ok = |output: Value| {
+        test_support::validate_schema_instance(
+            &json!({"success": true, "output": output, "error": null}),
+            &act,
+        )
+    };
+
+    let snapshot = json!({
+        "execution_state": "completed",
+        "state_changed": false,
+        "browser_id": "browser_abcdefghijklmnop",
+        "page_id": "page_abcdefghijklmnop",
+        "snapshot_generation": 4,
+        "snapshot_mode": "interactive",
+        "auto_compacted": true,
+        "max_nodes": 256,
+        "max_depth": 32,
+        "node_count": 3,
+        "truncated": false,
+        "nodes": [
+            {
+                "role": "combobox",
+                "name": "Fruit",
+                "description": "Choose one",
+                "required": true,
+                "disabled": false,
+                "element_id": "element_abcdefghijklmnop",
+                "actions": ["select_option"],
+                "actionable": true
+            },
+            {
+                "role": "option",
+                "name": "Apple",
+                "value": "a",
+                "group_id": "group_1",
+                "group_role": "combobox",
+                "group_label": "Fruit",
+                "selected": true,
+                "disabled": false,
+                "actionable": false
+            },
+            {
+                "role": "checkbox",
+                "name": "Agree",
+                "checked": "true",
+                "read_only": true,
+                "disabled": false,
+                "element_id": "element_bbcdefghijklmnop",
+                "actions": ["click"],
+                "actionable": true
+            }
+        ]
+    });
+    observe_ok(snapshot.clone()).expect("canonical compact snapshot");
+
+    let diagnostics = json!({
+        "execution_state": "completed",
+        "state_changed": false,
+        "cursor": 5,
+        "since_cursor": 3,
+        "delta_truncated": false,
+        "new_console_errors": 1,
+        "new_console_warnings": 0,
+        "new_failed_requests": 0,
+        "new_4xx": 1,
+        "new_5xx": 0,
+        "console_retained": 1,
+        "console_count": 1,
+        "console_truncated": false,
+        "console": [{"level": "error", "text": "boom", "source": null, "timestamp": 1.0}],
+        "network_retained": 1,
+        "network_count": 1,
+        "network_truncated": false,
+        "network": [{
+            "method": "GET",
+            "url": "https://example.test/api",
+            "resource_type": "Fetch",
+            "status": 404,
+            "failed_reason": null,
+            "timestamp": 2.0
+        }]
+    });
+    observe_ok(diagnostics).expect("canonical diagnostics delta");
+
+    let console = json!({
+        "execution_state": "completed",
+        "state_changed": false,
+        "cursor": 3,
+        "retained_count": 1,
+        "count": 1,
+        "truncated": false,
+        "entries": [{"level": "warning", "text": "warn", "source": null, "timestamp": 1.0}]
+    });
+    observe_ok(console).expect("canonical console observation");
+
+    let effect = json!({
+        "execution_state": "completed",
+        "state_changed": true,
+        "stability": {
+            "stable": false,
+            "waited_ms": 250,
+            "reason": "dom_quiet_with_long_lived_network"
+        }
+    });
+    act_ok(effect.clone()).expect("canonical effect stability");
+
+    let mut leaked_target = snapshot.clone();
+    leaked_target["target_id"] = json!("private-cdp-target");
+    assert!(observe_ok(leaked_target).is_err());
+    let mut leaked_backend = snapshot;
+    leaked_backend["nodes"][1]["backend_node_id"] = json!(11);
+    assert!(observe_ok(leaked_backend).is_err());
+    let mut unknown_action = json!({
+        "execution_state": "completed",
+        "state_changed": false,
+        "browser_id": "browser_abcdefghijklmnop",
+        "page_id": "page_abcdefghijklmnop",
+        "snapshot_generation": 1,
+        "node_count": 1,
+        "truncated": false,
+        "nodes": [{
+            "role": "button",
+            "actions": ["spinbutton"],
+            "actionable": true
+        }]
+    });
+    assert!(observe_ok(unknown_action.clone()).is_err());
+    unknown_action["nodes"][0]["actions"] = json!(["click"]);
+    observe_ok(unknown_action).expect("known click action");
+    let mut leaked_endpoint = effect;
+    leaked_endpoint["debug_endpoint"] = json!("ws://127.0.0.1/devtools");
+    assert!(act_ok(leaked_endpoint).is_err());
 }

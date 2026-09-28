@@ -12,6 +12,7 @@ fn retired_delete_files_alias_stays_absent() {
     assert!(!registered_tool_specs()
         .iter()
         .any(|spec| spec.name == "delete_files"));
+    #[cfg(feature = "legacy-gpt-actions")]
     assert!(crate::openapi::build_openapi_spec()["paths"]
         .get("/api/projects/delete_files")
         .is_none());
@@ -89,9 +90,16 @@ fn tool_call_parser_name_gate_matches_tool_definitions() {
     let expected_hidden: BTreeSet<&str> = [
         "start_session",
         "job_tail",
-        "goal_plan_state",
+        "goal_plan_sync",
         "work_result_state",
+        "work_result_activity_detail",
+        "work_result_send_message",
+        "apply_patch",
+        "apply_unified_diff",
+        "write_project_file",
         "changes_file_diff",
+        "record_external_observation",
+        "session_handoff_state",
         "agent_continuation_bind",
         "agent_continuation_recover_endpoint",
         "agent_continuation_state",
@@ -124,7 +132,7 @@ fn tool_call_parser_name_gate_matches_tool_definitions() {
     assert_eq!(
         model_hidden_tool_names().collect::<BTreeSet<_>>(),
         expected_hidden,
-        "hidden ToolDefinitions must match the documented compatibility batch"
+        "hidden ToolDefinitions must match the documented App-only and compatibility inventory"
     );
 }
 

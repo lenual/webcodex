@@ -284,27 +284,10 @@ impl ToolRuntime {
         if !auth.has_scope(SCOPE_PROJECT_READ) {
             return false;
         }
-        let result = self
-            .list_projects_with_options(
-                Some(auth),
-                ListProjectsOptions {
-                    project: Some(project.to_string()),
-                    limit: Some(1),
-                    summary_only: true,
-                    ..ListProjectsOptions::default()
-                },
-            )
-            .await;
-        result.success
-            && result
-                .output
-                .get("projects")
-                .and_then(Value::as_array)
-                .is_some_and(|projects| {
-                    projects
-                        .iter()
-                        .any(|value| value.get("id").and_then(Value::as_str) == Some(project))
-                })
+        let access = crate::runner_http::runner_access_from_auth(Some(auth));
+        self.runner_registry
+            .exact_project_visible_for_auth_snapshot(access.as_ref(), project)
+            .await
     }
 
     #[cfg(test)]
@@ -971,7 +954,7 @@ fn project_projection_reconcile_required(
             "reason_code": reason_code,
             "state_changed": state_changed,
             "client_id": client_id,
-            "agent_instance_id": runner_instance_id,
+            "runner_instance_id": runner_instance_id,
             "agent_project_id": project_id.clone(),
             "revision": revision.clone(),
             "authoritative_outcome": result.get("outcome").cloned().unwrap_or(Value::Null),

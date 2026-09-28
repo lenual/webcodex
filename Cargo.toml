@@ -7,6 +7,7 @@ members = [
     "crates/webcodex-runner-config",
     "crates/webcodex-cli",
     "crates/webcodex-core",
+    "crates/webcodex-environment",
     "crates/webcodex-lsp",
     "crates/webcodex-persistent-shell",
     "crates/webcodex-process",
@@ -22,7 +23,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.4.1"
+version = "0.4.3"
 license = "Apache-2.0"
 edition = "2021"
 
@@ -34,6 +35,7 @@ edition.workspace = true
 
 [features]
 default = []
+legacy-gpt-actions = ["webcodex-tool-contracts/legacy-gpt-actions"]
 experimental-code-mode = [
     "dep:webcodex-code-mode",
     "webcodex-code-mode/v8-runtime",
@@ -56,6 +58,7 @@ webcodex-code-mode = { path = "crates/webcodex-code-mode", optional = true }
 webcodex-runner-config = { path = "crates/webcodex-runner-config" }
 webcodex-runner-registry = { path = "crates/webcodex-runner-registry" }
 webcodex-core = { path = "crates/webcodex-core" }
+webcodex-environment = { path = "crates/webcodex-environment" }
 webcodex-tool-contracts = { path = "crates/webcodex-tool-contracts" }
 webcodex-tool-runtime-contracts = { path = "crates/webcodex-tool-runtime-contracts" }
 webcodex-validation = { path = "crates/webcodex-validation" }

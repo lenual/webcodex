@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { MantineProvider } from "@mantine/core";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LocaleProvider } from "../i18n/locale";
@@ -14,7 +15,7 @@ const api = vi.hoisted(() => ({ saveTunnelProfile: vi.fn(), tunnelProfileAction:
 vi.mock("../lib/desktop-api", () => ({ desktopApi: api }));
 vi.mock("@tauri-apps/plugin-clipboard-manager", () => ({ writeText: vi.fn() }));
 const target = { config_path: "/fixture/runner.toml", client_id: "fixture", server_url: "http://127.0.0.1:62645" };
-const settings: RunnerSettings = { target, paths: { instruction_files: [], skill_roots: [] }, plugin_ids: [], can_restart: true };
+const settings: RunnerSettings = { target, paths: { instruction_files: [], skill_roots: [] }, file_access: { configured_roots: [], effective_roots: ["/fixture"], using_default_roots: true, allow_cwd_anywhere: false }, plugin_ids: [], can_restart: true };
 function state(): DesktopState {
   return {
     topology: { experience: "full", server: { kind: "local" }, runner: { kind: "local" }, exposure: { kind: "none" }, enrollment: { kind: "managed_pairing" } },
@@ -22,14 +23,14 @@ function state(): DesktopState {
     readiness: { runtime_ready: true, ready_for_chatgpt: false, server: "ready", runner: "ready", exposure: "local_ready", project: "ready", summary: "Ready", summary_kind: "runtime_ready_local_only", next_action: "", next_action_kind: "choose_connection" },
     openai_tunnel_config: { source: "file", tunnel_id_present: true, api_key_present: true, saved_tunnel_id: "tunnel_fixture", effective_tunnel_id: "tunnel_fixture" },
     activity_sequence: 0, openai_tunnel_configured: true, regular_tunnel_available: true, runtime_autostart: true, preferred_connection: "no_chat_gpt",
-    tunnel_proxy: { mode: "auto", custom_url: null, effective_source: "direct", effective_url: null, detected_url: null },
+    tunnel_proxy: { mode: "auto", custom_url: null, effective_source: "direct", effective_proxy_present: false, system_proxy_detected: false },
     connections: connectionSnapshot(connectionFixture({ id: "personal", name: "ChatGPT Personal" }), connectionFixture({ id: "work", name: "ChatGPT Work", lifecycle: "error", pid: null, ready: false, last_error: "process_exited" }), connectionFixture({ id: "third", name: "Account 3", pid: 300 })),
     mcp_providers: { ...EMPTY_MCP_PROVIDERS, profiles: [] },
   };
 }
 function Harness({ mode, initial = state() }: { mode: "connections" | "mcp"; initial?: DesktopState }) {
   const [snapshot, setSnapshot] = useState(initial);
-  return <LocaleProvider>{mode === "connections" ? <ConnectionPanel state={snapshot} onState={setSnapshot} /> : <McpProvidersPanel state={snapshot} onState={setSnapshot} settings={settings} onRestarted={() => undefined} />}</LocaleProvider>;
+  return <MantineProvider><LocaleProvider>{mode === "connections" ? <ConnectionPanel state={snapshot} onState={setSnapshot} /> : <McpProvidersPanel state={snapshot} onState={setSnapshot} settings={settings} onRestarted={() => undefined} />}</LocaleProvider></MantineProvider>;
 }
 beforeEach(() => {
   vi.resetAllMocks(); localStorage.setItem("webcodex.desktop.locale", "en-US");
@@ -74,6 +75,29 @@ describe("Connections + Tools control surfaces", () => {
     await waitFor(() => expect(api.tunnelProfileAction).toHaveBeenLastCalledWith("work", "start"));
     expect(api.tunnelProfileAction.mock.calls.every(([id]) => id === "work")).toBe(true);
     expect(api.restartOwnedRunner).not.toHaveBeenCalled();
+  });
+
+  it("offers Direct as a contextual recovery check only when Auto failed through a detected proxy", async () => {
+    const initial = state();
+    initial.tunnel_proxy = { mode: "auto", custom_url: null, effective_source: "system", effective_proxy_present: true, system_proxy_detected: true };
+    api.tunnelProfileAction.mockRejectedValueOnce({ code: "tunnel_unavailable", message: "Tunnel unavailable", next_action: "Retry" });
+    render(<Harness mode="connections" initial={initial} />);
+    fireEvent.click(screen.getByRole("button", { name: "Restart ChatGPT Personal" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Auto is using a detected proxy");
+    expect(alert).toHaveTextContent("If Clash TUN or another local/system proxy is active, try Direct mode");
+    expect(alert).toHaveTextContent("does not identify the root cause");
+  });
+
+  it("does not attribute unrelated Tunnel failures to Clash or proxy detection", async () => {
+    const initial = state();
+    initial.tunnel_proxy = { mode: "auto", custom_url: null, effective_source: "system", effective_proxy_present: true, system_proxy_detected: true };
+    api.tunnelProfileAction.mockRejectedValueOnce({ code: "process_failed", message: "Process failed", next_action: "Retry" });
+    render(<Harness mode="connections" initial={initial} />);
+    fireEvent.click(screen.getByRole("button", { name: "Restart ChatGPT Personal" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert).not.toHaveTextContent("Clash");
+    expect(alert).not.toHaveTextContent("Direct mode");
   });
 
   it("requires confirmation to delete exactly one profile and leaves other cards", async () => {

@@ -44,6 +44,26 @@ successive continuation Attempts. Rust projection and capability tests use
 `cargo test --locked -p webcodex --lib goal`, and
 `cargo test --locked -p webcodex --lib agent_continuation`.
 
+## Read snapshots and range planning
+
+`cargo test --locked -p webcodex --lib read_cache` covers bounded Session
+snapshot retention and read-only singleflight ownership. Run
+`cargo test --locked -p webcodex --lib read_files` for the canonical read path,
+range planning, byte-limit fallback, revision fences, and Runner replacement.
+These use deterministic in-memory Runner fixtures, not deployed Runners.
+
+The Session cache is a transfer optimization: every hit validates the current
+full-file SHA through a one-line read on the owning Runner. It does not skip
+the Runner's full-file scan, use TTL/mtime as freshness evidence, or make a
+revision an immutable filesystem snapshot. A changed SHA discards the cached
+ranges: fenced reads reject a stale revision immediately, while unfenced reads
+read the requested range again. Concurrent identical physical reads
+share only pending work within the same authority, Session, exact Project and
+Runner incarnation; each canonical call still authorizes, records and projects
+its own result. Without an explicit authorized Session, only in-flight sharing
+is enabled. Snapshot retention is bounded to 64 entries / 8 MiB per runtime,
+and the in-flight index to 128 entries (excess reads bypass sharing).
+
 ## Full Local Server Suite
 
 Plain `cargo test` must work without a special environment variable or wrapper,
@@ -79,9 +99,9 @@ change is ready for review.
 The lanes above define test semantics; workflows decide when to run them.
 
 - `.github/workflows/ci.yml` is the ordinary repository gate. Its cheap `changes`
-  job classifies the exact PR base...head path set before native scheduling, while
-  the `contract` job remains mandatory for every configured pull request and every
-  push to `main`. The classifier is deterministic and local to Git: it does not use
+  job classifies the exact PR or merge-group base...head path set before native scheduling,
+  while the `contract` job remains mandatory for every configured pull request,
+  every merge-queue candidate, and every push to `main`. The classifier is deterministic and local to Git: it does not use
   commit messages or PR titles, and it emits frontend, per-platform, and package-lane
   requirements. For changed Rust/Cargo files it searches only bounded platform-marker
   lines from both the base and head file versions, so body-only changes inside an
@@ -91,16 +111,19 @@ The lanes above define test semantics; workflows decide when to run them.
   only an untrustworthy changed-path inventory falls back to the complete native
   matrix. The contract lane always owns workspace-boundary self-test/checks,
   formatting, the heuristic test-inventory self-test/report (without count thresholds),
-  and focused registry/OpenAPI/MCP schema and metadata parity. Main and Desktop
+  and focused registry/MCP schema and metadata parity. Main and Desktop
   frontend dependency installation/type/test/build steps run only when the classifier
   selects their respective frontend surface; full-native invocations select both.
 - The heavy Linux Rust matrix `test-linux-rust` and Linux tooling lane
-  `test-linux-tooling` run for every pull request as well as every push to `main`,
-  including owner-authored PRs. They start in parallel with `contract` rather than
+  `test-linux-tooling` run for every pull request, every merge-queue candidate, and
+  every push to `main`, including owner-authored PRs. They start in parallel with `contract` rather than
   waiting for unrelated frontend/static work. Native child lanes likewise wait only
   for the cheap `changes` classifier, while the stable macOS/Windows/native aggregates
-  retain the mandatory `contract` gate. Pushes to `main`, external-contributor PRs,
-  and owner PRs carrying `run-ci` force the complete deterministic native matrix.
+  retain the mandatory `contract` gate. Merge-group candidates use the exact
+  GitHub-provided synthetic base/head range and fetch the synthetic head by ref when
+  needed; an unavailable merge-group diff fails closed to the complete native matrix.
+  Pushes to `main`, external-contributor PRs, and owner PRs carrying `run-ci` also
+  force the complete deterministic native matrix.
   Real-process and timing-sensitive ignored tests are deliberately outside ordinary
   CI, including full-native overrides: run them explicitly when changing their
   lifecycle boundary or investigating platform behavior. Computer, platform-specific,
@@ -109,6 +132,10 @@ The lanes above define test semantics; workflows decide when to run them.
   `test-windows`, and `test-native` aggregates always resolve and verify each child
   lane is `success` when required or `skipped` when not required, avoiding a skipped
   required-check context that could leave branch protection pending.
+  The stable `test` and `test-native` contexts are also emitted for `merge_group`.
+  GitHub currently exposes Merge Queue only for eligible organization-owned repositories,
+  so this path remains dormant in this personal repository; it is retained as migration-ready
+  CI support if the repository later moves to an eligible organization.
 - MCP dated-revision evidence has its own bounded `mcp-conformance` lane. It pins
   and freshly builds the upstream referee, runs the `2026-07-28` and `2025-11-25`
   server requirements against a test-only loopback WebCodex endpoint, validates
@@ -117,6 +144,13 @@ The lanes above define test semantics; workflows decide when to run them.
   abnormal/infrastructure runs, stale or changed classifications, and unclassified
   new failures are merge-blocking. See [`MCP_CONFORMANCE.md`](MCP_CONFORMANCE.md)
   for baseline semantics.
+- GPT Actions are a default-off legacy compatibility surface. Ordinary PR,
+  merge-queue, main-push, and release-readiness CI do not enable
+  `legacy-gpt-actions` and therefore do not compile or test its OpenAPI/HTTP
+  adapter. `.github/workflows/legacy-gpt-actions.yml` runs the feature weekly
+  and on manual dispatch, including the frozen surface contract and the
+  feature-enabled Server tests. For local compatibility work use
+  `cargo test -p webcodex --lib --features legacy-gpt-actions`.
 - Linux Rust execution remains package-sharded: the server package `webcodex`, the
   Runner/LSP packages, and the remaining workspace crates run in parallel. The
   Runner/LSP shard compiles with `--features runner-real-process-tests` to prevent
@@ -285,3 +319,14 @@ Do not add large ordinary test blocks to production facade files when one of
 these `tests/` module trees already exists. Exact full-suite pass counts should
 come from a fresh `cargo test -p webcodex --lib` run; this document should not be
 treated as the source of truth for exact counts.
+
+## Runner observability contract
+
+Run `python scripts/tests/test_runner_observability_contract.py` for the exact-name
+projection guard used by CI. It covers observation producers and readers while
+leaving Runner registration wire keys and durable Agent APIs unchanged. Behavior
+coverage lives in the `metadata`, `runtime_http`, `runtime_console_http`,
+`admin_http`, `runner_capabilities`, and `startup_runner_tests` Server filters,
+and the CLI `ops` and `server::status` filters. Run
+`pwsh -NoProfile -File scripts/test_windows_runner_readiness.ps1` for Windows
+readiness parsing. These checks do not replace Linux socket-activation E2E.

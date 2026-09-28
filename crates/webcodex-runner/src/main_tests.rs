@@ -7,6 +7,23 @@ use crate::webcodex_runner::{
     handle_prepare_managed_worktree, handle_project_lifecycle_op, handle_project_op,
     handle_resolve_or_register_project,
 };
+/// Create a test temp directory on the repository build filesystem.
+///
+/// Some hardened hosts mount the system temp directory with `noexec`. Tests
+/// that intentionally create and execute fake binaries/scripts must not assume
+/// `tempfile::tempdir()` is executable. Keep ordinary data-only temp dirs on
+/// the system temp filesystem; use this helper only for executable fixtures.
+pub(crate) fn executable_tempdir() -> tempfile::TempDir {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target")
+        .join("test-executables");
+    std::fs::create_dir_all(&root).expect("create executable test temp root");
+    tempfile::Builder::new()
+        .prefix("webcodex-runner-exec-")
+        .tempdir_in(root)
+        .expect("create executable test temp dir")
+}
+
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -367,6 +384,8 @@ fn json_file_op_request(
     payload: serde_json::Value,
 ) -> RunnerRequest {
     RunnerRequest {
+        login: false,
+        shell: None,
         request_id: format!("req-{kind}"),
         client_id: "agent-1".to_string(),
         kind: kind.to_string(),
@@ -626,7 +645,7 @@ fn shell_tree_helper() -> PathBuf {
         .get_or_init(|| {
             let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("src/webcodex_runner/validation/validation_tree_helper.rs");
-            let temp = tempfile::tempdir().unwrap();
+            let temp = executable_tempdir();
             let output = temp
                 .path()
                 .join(format!("shell-tree-helper{}", std::env::consts::EXE_SUFFIX));
@@ -858,6 +877,7 @@ fn shell_job_native_exe_nonzero_exit_code_is_preserved() {
     // fixture. This test only verifies PowerShell native-exit propagation; a freshly
     // generated EXE can be delayed by Windows malware scanning under parallel CI and
     // would turn that unrelated startup latency into a false shell timeout.
+    // Allow time for PowerShell startup on a busy Windows CI host as well.
     let command_processor = std::env::var_os("ComSpec")
         .map(PathBuf::from)
         .filter(|path| path.is_file())
@@ -875,7 +895,7 @@ fn shell_job_native_exe_nonzero_exit_code_is_preserved() {
         Some(&cwd),
         &command,
         None,
-        10,
+        30,
         None,
     );
     assert_eq!(result.exit_code, Some(3), "{result:?}");
@@ -1047,6 +1067,8 @@ fn project_policy(root: &Path) -> RunnerPolicy {
 
 fn project_request(kind: &str, payload: serde_json::Value) -> RunnerRequest {
     RunnerRequest {
+        login: false,
+        shell: None,
         request_id: format!("req-{}", kind),
         client_id: "oe".to_string(),
         kind: kind.to_string(),

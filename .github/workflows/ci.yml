@@ -2,12 +2,19 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - 'release/**'
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  merge_group:
+    types: [checks_requested]
 
-# Keep only the newest run for a PR. Main pushes use the commit SHA as the
-# group key, while both PR and main runs use path-aware daily CI classification.
+permissions:
+  contents: read
+
+# PR runs coalesce by PR number. Merge-group candidates plus main/release pushes use
+# the exact candidate SHA as the group key so each integration candidate keeps its evidence.
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
@@ -17,9 +24,10 @@ env:
 
 jobs:
   changes:
-    # Classify only trusted event metadata plus base...head Git data. For PRs the
-    # classifier is loaded from the trusted base commit, so a PR cannot weaken its
-    # own native gates. If the trusted base predates the classifier, fail safe to
+    # Classify only trusted event metadata plus base...head Git data. For PRs and
+    # merge-group candidates the classifier is loaded from the trusted base commit,
+    # so candidate changes cannot weaken their own native gates. If the trusted base
+    # predates the classifier, fail safe to
     # the full daily native matrix instead of executing classifier code from the PR head.
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -47,7 +55,7 @@ jobs:
       - name: Checkout trusted classifier source
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Classify native CI risk
@@ -56,9 +64,10 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           EXTERNAL_CONTRIBUTOR: ${{ github.event_name == 'pull_request' && github.event.pull_request.user.login != github.repository_owner }}
           RUN_CI: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-ci') }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before || '' }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref || '' }}
         run: |
           set -euo pipefail
           classifier="scripts/ci_path_risk.py"
@@ -99,6 +108,20 @@ jobs:
             fi
           fi
 
+          if [ "$EVENT_NAME" = merge_group ] && \
+             ! git cat-file -e "$HEAD_SHA^{commit}" 2>/dev/null; then
+            if [ -z "$MERGE_GROUP_HEAD_REF" ]; then
+              echo "merge-group head ref is missing" >&2
+              exit 1
+            fi
+            git fetch --no-tags origin "$MERGE_GROUP_HEAD_REF"
+            fetched_head="$(git rev-parse FETCH_HEAD)"
+            if [ "$fetched_head" != "$HEAD_SHA" ]; then
+              echo "fetched merge-group head does not match event head SHA" >&2
+              exit 1
+            fi
+          fi
+
           python3 "$classifier" \
             --event-name "$EVENT_NAME" \
             --external-contributor "$EXTERNAL_CONTRIBUTOR" \
@@ -135,8 +158,9 @@ jobs:
             plugins/repo-info/package-lock.json
             plugins/repo-context/package-lock.json
             plugins/campus-application/package-lock.json
+            plugins/agent-browser/package-lock.json
       - name: Install frontend dependencies
-        if: needs.changes.outputs.needs_frontend == 'true'
+        if: needs.changes.outputs.needs_frontend == 'true' || needs.changes.outputs.needs_desktop_frontend == 'true'
         run: npm ci --prefix frontend
       - name: Check frontend contracts
         if: needs.changes.outputs.needs_frontend == 'true'
@@ -161,6 +185,7 @@ jobs:
           npm ci --prefix plugins/repo-info
           npm ci --prefix plugins/repo-context
           npm ci --prefix plugins/campus-application
+          npm ci --prefix plugins/agent-browser
       - name: Check Plugin SDK contracts and first-party dogfood
         if: needs.changes.outputs.needs_plugin_sdk == 'true'
         run: |
@@ -176,6 +201,8 @@ jobs:
           npm --prefix plugins/repo-context test
           npm --prefix plugins/campus-application run typecheck
           npm --prefix plugins/campus-application test
+          npm --prefix plugins/agent-browser run typecheck
+          npm --prefix plugins/agent-browser test
       - name: Verify workspace boundaries
         run: |
           bash scripts/workspace_boundary_check.sh --self-test
@@ -194,10 +221,10 @@ jobs:
           bash scripts/test_inventory.sh
       - name: Check schema and metadata contracts
         run: |
-          cargo test --locked -p webcodex --lib openapi
+          python3 scripts/tests/test_runner_observability_contract.py
           cargo test --locked -p webcodex --lib mcp_tools_list
-          cargo test --locked -p webcodex --lib tool_definition_surface_counts_and_action_projection_stay_canonical
-          cargo test --locked -p webcodex --lib external_provider_discovery_cannot_change_public_tool_or_openapi_surface
+          cargo test --locked -p webcodex --lib tool_definition_surface_counts_stay_canonical
+          cargo test --locked -p webcodex --lib external_provider_discovery_cannot_change_public_tool_surface
 
   mcp-conformance:
     # Dated MCP wire evidence is independent from ordinary unit/integration tests.
@@ -284,6 +311,8 @@ jobs:
             sudo apt-get update
             sudo apt-get install --no-install-recommends -y ripgrep
           fi
+      - name: Test optional Codex observation adapter
+        run: python3 -m unittest discover -s integrations/codex -p 'test_*.py' -v
       - name: Check complete workspace production/test targets
         if: github.event_name == 'pull_request' && (github.event.pull_request.user.login != github.repository_owner || contains(github.event.pull_request.labels.*.name, 'run-ci'))
         run: cargo check --locked --workspace --all-targets
@@ -351,7 +380,10 @@ jobs:
             WEBCODEX_GIT_DIRTY=false
             WEBCODEX_BUILT_AT=${{ env.WEBCODEX_CI_BUILT_AT }}
           cache-from: type=gha,scope=server-image-ci-amd64
-          cache-to: type=gha,mode=max,scope=server-image-ci-amd64
+          # GHA cache export is a performance optimization, not image evidence.
+          # BuildKit can transiently return layer-blob not_found after the image
+          # itself has built; keep build/load/smoke authoritative in that case.
+          cache-to: type=gha,mode=max,scope=server-image-ci-amd64,ignore-error=true
           provenance: false
           sbom: false
       - name: Smoke amd64 Server image
@@ -449,7 +481,9 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: apps/desktop/package-lock.json
+          cache-dependency-path: |
+            frontend/package-lock.json
+            apps/desktop/package-lock.json
       - name: Verify native macOS host
         env:
           EXPECTED_HOST_ARCH: ${{ matrix.host_arch }}
@@ -458,6 +492,8 @@ jobs:
           test "$(uname -m)" = "$EXPECTED_HOST_ARCH"
           rust_host="$(rustc -vV | sed -n 's/^host: //p')"
           test "$rust_host" = "$EXPECTED_RUST_HOST"
+      - name: Install shared frontend dependencies
+        run: npm ci --prefix frontend
       - name: Install Desktop dependencies
         run: npm ci --prefix apps/desktop
       - name: Check Desktop frontend
@@ -605,6 +641,12 @@ jobs:
         run: cargo check --locked --workspace
       - name: Run Windows library and CLI tests
         run: cargo test --locked -p webcodex-runner-config -p webcodex-process -p webcodex-cli
+      - name: Run Windows search fallback tests
+        run: |
+          cargo test --locked -p webcodex --lib search_project_text_grep
+          if ($LASTEXITCODE -ne 0) { throw "Windows grep fallback tests failed" }
+          cargo test --locked -p webcodex --lib search_requires_ripgrep_based_on_effective_features_not_field_presence
+          if ($LASTEXITCODE -ne 0) { throw "Windows search capability test failed" }
 
   test-windows-runner:
     needs: changes
@@ -618,6 +660,11 @@ jobs:
         with:
           shared-key: windows-runner-ci
       - name: Run Windows Runner and Computer tests
+        # This lane starts real PowerShell/MCP child processes. Keep the Rust
+        # harness bounded so hosted-runner scheduling does not consume their
+        # production startup/request deadlines.
+        env:
+          RUST_TEST_THREADS: "2"
         run: cargo test --locked -p webcodex-runner -p webcodex-lsp -p webcodex-computer --features runner-real-process-tests
 
   test-windows-package:
@@ -662,7 +709,11 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: apps/desktop/package-lock.json
+          cache-dependency-path: |
+            frontend/package-lock.json
+            apps/desktop/package-lock.json
+      - name: Install shared frontend dependencies
+        run: npm ci --prefix frontend
       - name: Install Desktop dependencies
         run: npm ci --prefix apps/desktop
       - name: Check Desktop frontend
@@ -742,6 +793,15 @@ jobs:
             -SourceSha "${{ steps.runtime.outputs.source }}" `
             -BuiltAt ([Int64]"${{ steps.runtime.outputs.built_at }}") `
             -Platform win32-x64
+
+          $customInstallDir = Join-Path $env:RUNNER_TEMP "WebCodex Custom Install"
+          & .\scripts\desktop_install_windows_smoke.ps1 `
+            -Installer $env:DESKTOP_CI_INSTALLER `
+            -Version "${{ steps.runtime.outputs.version }}" `
+            -SourceSha "${{ steps.runtime.outputs.source }}" `
+            -BuiltAt ([Int64]"${{ steps.runtime.outputs.built_at }}") `
+            -Platform win32-x64 `
+            -InstallDir $customInstallDir
 
   test-windows:
     needs: [contract, changes, test-windows-core, test-windows-runner, test-windows-package, test-windows-desktop]

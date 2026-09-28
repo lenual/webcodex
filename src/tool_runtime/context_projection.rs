@@ -3,7 +3,7 @@ use super::startup_brief::{
     builtin_coding_workflow_projection, project_instructions_context_projection,
 };
 use super::tool_inputs::CodingGuidanceProfile;
-use super::{ToolResult, ToolRuntime};
+use super::{SuggestedToolCall, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
 use crate::json_measurement::serialized_json_len;
 use serde::Serialize;
@@ -443,14 +443,19 @@ impl ToolRuntime {
                 candidates_truncated = true;
                 break;
             }
-            candidates.push(json!({
+            let session_ref = self.session_reference_for_id(&session_id, auth);
+            let mut candidate = json!({
                 "session_id": session_id,
                 "project": project,
                 "lifecycle": "active",
                 "title": title,
                 "relations": link.relations,
                 "last_linked_at_ms": link.last_linked_at_ms,
-            }));
+            });
+            if let Some(session_ref) = session_ref {
+                candidate["session_ref"] = json!(session_ref);
+            }
+            candidates.push(candidate);
         }
 
         let mut projection = json!({
@@ -460,10 +465,14 @@ impl ToolRuntime {
             "selection": "caller_must_choose_exact_session",
         });
         if candidates.len() == 1 {
-            projection["suggested_call"] = json!({
-                "tool": "session_handoff_summary",
-                "arguments": {"session_id": candidates[0]["session_id"]},
-            });
+            let session_selector = candidates[0]
+                .get("session_ref")
+                .unwrap_or(&candidates[0]["session_id"]);
+            projection["suggested_call"] = SuggestedToolCall::fallback_recovery(
+                "session_handoff_summary",
+                json!({"session_id": session_selector}),
+            )
+            .to_value();
         }
         Ok(projection)
     }

@@ -80,11 +80,58 @@ pub(in crate::tool_runtime::tests) fn assert_safe_patch_command(command: &str, m
     );
 }
 
+pub(in crate::tool_runtime::tests) fn observe_job_continuation_job_id(output: &Value) -> &str {
+    output["continuation"]["arguments"]["items"][0]["job_id"]
+        .as_str()
+        .filter(|job_id| !job_id.is_empty())
+        .expect("Job continuation must carry exact durable identity")
+}
+
+pub(in crate::tool_runtime::tests) fn assert_sparse_pending_job_handoff(output: &Value) -> &str {
+    assert_eq!(output["execution_state"], "pending");
+    assert_observe_job_continuation(output);
+    let keys = output
+        .as_object()
+        .expect("pending handoff output object")
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        keys,
+        ["continuation", "execution_state", "pending_strategy"]
+            .into_iter()
+            .collect(),
+        "normal model-facing pending handoff must stay sparse"
+    );
+    let pending_strategy = &output["pending_strategy"];
+    assert_eq!(pending_strategy["default"], "continue_independent_work");
+    assert_eq!(
+        pending_strategy["passive_terminal_attention"],
+        "same_scope_may_surface"
+    );
+    assert_eq!(
+        pending_strategy["observe_continuation"],
+        "logs_details_recovery_fallback"
+    );
+    assert_eq!(pending_strategy["observe_auto_follow"], false);
+    assert_eq!(
+        pending_strategy["blocked_fallback"],
+        "wait_for_job_terminal"
+    );
+    observe_job_continuation_job_id(output)
+}
+
 pub(in crate::tool_runtime::tests) fn assert_observe_job_continuation(output: &Value) {
     use crate::tool_runtime::{ObserveJobsWakeOn, ToolCall};
     let hint = &output["continuation"];
     assert_eq!(hint["tool"], "observe_jobs");
-    assert_eq!(hint["arguments"]["items"][0]["job_id"], output["job_id"]);
+    assert_eq!(hint["follow_up_kind"], "fallback_recovery");
+    webcodex_tool_contracts::test_support::validate_generated_tool_call_against_registered_input_schema(hint)
+        .expect("Job continuation must pass the registered observe_jobs inputSchema");
+    let continuation_job_id = observe_job_continuation_job_id(output);
+    if let Some(job_id) = output.get("job_id").and_then(Value::as_str) {
+        assert_eq!(continuation_job_id, job_id);
+    }
     if let Some(token) = output.get("observation_token") {
         assert_eq!(
             hint["arguments"]["items"][0]["after_observation_token"],
@@ -101,13 +148,13 @@ pub(in crate::tool_runtime::tests) fn assert_observe_job_continuation(output: &V
     assert!(matches!(
         call,
         ToolCall::ObserveJobs {
-            wait_secs: Some(webcodex_core::runtime_contract::MODEL_JOB_CONTINUATION_WAIT_SECS),
+            wait_secs: Some(webcodex_core::runtime_contract::DEFAULT_JOB_CONTINUATION_WAIT_SECS),
             wake_on: ObserveJobsWakeOn::Terminal,
             ..
         }
     ));
     assert!(
-        webcodex_core::runtime_contract::MODEL_JOB_CONTINUATION_WAIT_SECS
+        webcodex_core::runtime_contract::DEFAULT_JOB_CONTINUATION_WAIT_SECS
             <= webcodex_core::runtime_contract::MAX_JOB_OBSERVATION_WAIT_SECS
     );
 }

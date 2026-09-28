@@ -17,7 +17,6 @@ use crate::runner_protocol::{
     ShellJobValidationProgress, ShellJobValidationStep, JOB_INVENTORY_MAX_TERMINAL_JOBS,
 };
 use crate::tool_runtime::sessions::{SessionTransport, DEFAULT_MAX_EVENTS_PER_SESSION};
-use crate::tool_runtime::structured_execution::STRUCTURED_EXECUTION_SYNC_WAIT_SECS;
 use crate::tool_runtime::validation_events::validation_summary_for_session;
 use crate::tool_runtime::{ObserveJobsItem, ObserveJobsWakeOn, ToolCall, ToolRuntime};
 use serde_json::json;
@@ -29,6 +28,19 @@ pub(super) async fn poll_start_validation_job(
     client_id: &str,
 ) -> (crate::runner_protocol::RunnerRequest, String) {
     let request = wait_for_patch_agent_request(runtime, client_id).await;
+    assert_eq!(request.kind, "start_validation_job", "{:?}", request.kind);
+    let job_id = request.job_id.clone().expect("start_validation_job job_id");
+    (request, job_id)
+}
+
+pub(super) async fn poll_start_validation_job_with_timeout(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    timeout: std::time::Duration,
+) -> (crate::runner_protocol::RunnerRequest, String) {
+    let request =
+        wait_for_runner_request_for_instance_with_timeout(runtime, client_id, "inst", timeout)
+            .await;
     assert_eq!(request.kind, "start_validation_job", "{:?}", request.kind);
     let job_id = request.job_id.clone().expect("start_validation_job job_id");
     (request, job_id)
@@ -106,8 +118,8 @@ pub(super) fn cargo_test_update(
     request_id: &str,
     job_id: &str,
     status: &str,
-    stdout: &str,
-    stderr: &str,
+    stdout_chunk: &str,
+    stderr_chunk: &str,
     exit_code: Option<i32>,
     progress: ShellJobValidationProgress,
     finished: bool,
@@ -132,10 +144,8 @@ pub(super) fn cargo_test_update(
         job_id: job_id.to_string(),
         request_id: Some(request_id.to_string()),
         status: status.to_string(),
-        stdout_chunk: None,
-        stderr_chunk: None,
-        stdout_tail: Some(stdout.to_string()),
-        stderr_tail: Some(stderr.to_string()),
+        stdout_chunk: (!stdout_chunk.is_empty()).then(|| stdout_chunk.to_string()),
+        stderr_chunk: (!stderr_chunk.is_empty()).then(|| stderr_chunk.to_string()),
         log_snapshot: None,
         exit_code,
         duration_ms: Some(25),
@@ -189,6 +199,7 @@ async fn seed_retained_terminal_validation_job(
         .runner_registry
         .start_job_with_metadata(
             ShellJobOpRequest {
+                login: false,
                 op: "start".to_string(),
                 client_id: Some(client_id.to_string()),
                 cwd: Some("/tmp/agent-proj".to_string()),
@@ -332,28 +343,44 @@ fn assert_sparse_validation_terminal_success(result: &crate::tool_runtime::ToolR
 }
 
 fn sparse_validation_handoff_token(output: &serde_json::Value, job_id: &str) -> String {
-    assert_eq!(output["job_id"], job_id);
     assert_observe_job_continuation(output);
-    for redundant in [
-        "project",
-        "cwd",
-        "shell",
-        "executor",
-        "execution_source",
-        "purpose",
-        "promoted_to_job",
-        "async_handoff_available",
-        "observation_token",
-        "continuation_semantics",
-        "terminal",
-        "command_started",
-        "command_completed",
-        "sync_wait_secs",
-    ] {
+    assert_eq!(observe_job_continuation_job_id(output), job_id);
+    if output["execution_state"] == "pending" {
+        for redundant in [
+            "project",
+            "cwd",
+            "shell",
+            "executor",
+            "execution_source",
+            "purpose",
+            "promoted_to_job",
+            "async_handoff_available",
+            "observation_token",
+            "continuation_semantics",
+            "terminal",
+            "command_started",
+            "command_completed",
+            "sync_wait_secs",
+            "job_id",
+            "job_status",
+            "effective_timeout_secs",
+            "activity",
+            "detected_summary",
+        ] {
+            assert!(
+                output.get(redundant).is_none(),
+                "model-facing pending handoff leaked {redundant}: {output}"
+            );
+        }
+    } else {
         assert!(
-            output.get(redundant).is_none(),
-            "Job handoff leaked {redundant}: {output}"
+            matches!(
+                output["execution_state"].as_str(),
+                Some("queued" | "running")
+            ),
+            "internal validation handoff must remain canonical: {output}"
         );
+        assert_eq!(output["job_id"], job_id);
     }
     output["continuation"]["arguments"]["items"][0]["after_observation_token"]
         .as_str()
@@ -404,6 +431,88 @@ async fn go_test_rejects_empty_or_oversized_package_lists_before_dispatch() {
         assert!(!result.success);
         assert_eq!(result.output["command_started"], false);
     }
+    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
+    assert!(probe_patch_agent_request(&runtime, client_id)
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn multi_package_cargo_check_reports_legacy_runner_capability_before_job_creation() {
+    let client_id = "vhandoff-cargo-check-packages-legacy-runner";
+    let runtime = runtime_with_agent_project(client_id)
+        .with_validation_sync_wait(std::time::Duration::from_millis(20));
+    register_agent(
+        &runtime,
+        client_id,
+        None,
+        RunnerCapabilities {
+            async_shell_jobs: true,
+            structured_validation_argv: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id(client_id);
+    let auth = auth_context(None, true);
+    let call = ToolCall::from_tool_name(
+        "cargo_check",
+        json!({
+            "project": project,
+            "packages": ["package-a", "package-b"]
+        }),
+    )
+    .unwrap();
+
+    let result = runtime.dispatch_with_auth(call, Some(&auth)).await;
+
+    assert!(!result.success);
+    assert_eq!(result.output["command_started"], false);
+    assert_eq!(result.output["failure_kind"], "capability_unavailable");
+    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
+    assert!(probe_patch_agent_request(&runtime, client_id)
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn multi_package_cargo_check_direct_sync_still_requires_runner_capability() {
+    let client_id = "vhandoff-cargo-check-packages-legacy-direct";
+    let runtime = runtime_with_agent_project(client_id)
+        .with_validation_sync_wait(std::time::Duration::from_millis(20));
+    register_agent(
+        &runtime,
+        client_id,
+        None,
+        RunnerCapabilities {
+            async_shell_jobs: true,
+            structured_validation_argv: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id(client_id);
+    let auth = auth_context(None, true);
+    let call = ToolCall::from_tool_name(
+        "cargo_check",
+        json!({
+            "project": project,
+            "packages": ["package-a", "package-b"],
+            "timeout_secs": 30,
+            "sync_wait_secs": 30
+        }),
+    )
+    .unwrap();
+
+    let result = runtime.dispatch_with_auth(call, Some(&auth)).await;
+
+    assert!(!result.success);
+    assert_eq!(result.output["command_started"], false);
+    assert_eq!(result.output["failure_kind"], "capability_unavailable");
+    assert!(result
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("structured_cargo_check_packages_unavailable")));
     assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
     assert!(probe_patch_agent_request(&runtime, client_id)
         .await
@@ -675,13 +784,14 @@ async fn long_go_test_hands_off_same_job_and_terminal_evidence_is_queryable() {
     assert!(steps[0].env.is_empty());
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["effective_timeout_secs"], 1800);
+    assert_eq!(request.timeout_secs, 1800);
     let observation_token = sparse_validation_handoff_token(&result.output, &job_id);
     let observed = runtime
         .observe_jobs_for_auth(
             vec![ObserveJobsItem {
                 job_id: job_id.clone(),
                 after_observation_token: Some(observation_token.clone()),
+                observation_ref: None,
             }],
             40,
             None,
@@ -769,6 +879,7 @@ async fn fast_cargo_check_completes_in_windows_and_leaves_no_visible_job() {
                         no_default_features: None,
                         features: None,
                         package: None,
+                        packages: None,
                         timeout_secs: Some(600),
                         sync_wait_secs: Some(60),
                     },
@@ -875,53 +986,13 @@ async fn default_cargo_check_handoff_preserves_same_execution_through_terminal()
 
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["promoted_to_job"], true);
-    assert_eq!(
-        result.output["sync_wait_secs"],
-        STRUCTURED_EXECUTION_SYNC_WAIT_SECS
-    );
-    assert_eq!(result.output["execution_state"], "running");
-    assert_eq!(result.output["command_started"], true);
-    assert_eq!(result.output["command_completed"], false);
-    assert_eq!(result.output["terminal"], false);
-    assert!(result.output["stdout_tail"]
-        .as_str()
-        .is_some_and(|tail| tail.contains("Checking demo v0.1.0")));
-    assert_eq!(
-        result.output["detected_summary"]["progress"]["reason_code"],
-        "validation_check"
-    );
-    assert_eq!(
-        result.output["detected_summary"]["progress"]["state"],
-        "working"
-    );
-    assert_eq!(
-        result.output["detected_summary"]["progress"]["source"],
-        "validation_plan"
-    );
-    assert_eq!(
-        result.output["activity"],
-        json!({
-            "state": "working",
-            "phase": "validation_check",
-            "source": "validation_plan"
-        })
-    );
-    assert_eq!(result.output["job_id"], job_id);
-    assert_eq!(result.output["continuation"]["tool"], "observe_jobs");
-    assert_eq!(
-        result.output["continuation"]["arguments"]["items"][0]["job_id"],
-        job_id
-    );
-    let observation_token = result.output["observation_token"]
-        .as_str()
-        .expect("cargo_check handoff observation token")
-        .to_string();
+    let observation_token = sparse_validation_handoff_token(&result.output, &job_id);
     let observed = runtime
         .observe_jobs_for_auth(
             vec![ObserveJobsItem {
                 job_id: job_id.clone(),
                 after_observation_token: Some(observation_token.clone()),
+                observation_ref: None,
             }],
             40,
             None,
@@ -933,7 +1004,11 @@ async fn default_cargo_check_handoff_preserves_same_execution_through_terminal()
     assert_eq!(observed.output["items"][0]["success"], true);
     assert_eq!(
         observed.output["items"][0]["output"]["activity"],
-        result.output["activity"]
+        json!({
+            "state": "working",
+            "phase": "validation_check",
+            "source": "validation_plan"
+        })
     );
     assert_agent_observation_upgrades_without_changing_snapshot(
         &job_id,
@@ -977,6 +1052,89 @@ async fn default_cargo_check_handoff_preserves_same_execution_through_terminal()
             .is_none(),
         "terminal completion must remain the original execution"
     );
+}
+
+#[tokio::test]
+async fn multi_package_cargo_check_uses_one_execution_and_one_same_process_job() {
+    let client_id = "vhandoff-multi-package-check";
+    let runtime = runtime_with_agent_project(client_id)
+        .with_validation_sync_wait(std::time::Duration::from_millis(20));
+    register_agent(
+        &runtime,
+        client_id,
+        None,
+        RunnerCapabilities {
+            async_shell_jobs: true,
+            structured_validation_argv: true,
+            structured_cargo_check_packages: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id(client_id);
+    let auth = auth_context(None, true);
+    let call = ToolCall::from_tool_name(
+        "cargo_check",
+        json!({
+            "project": project,
+            "packages": ["package-c", "package-a", "package-b", "package-a"],
+            "timeout_secs": 600,
+            "sync_wait_secs": 1
+        }),
+    )
+    .unwrap();
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        async move { runtime.dispatch_with_auth(call, Some(&auth)).await }
+    });
+    let (request, job_id) = poll_start_validation_job(&runtime, client_id).await;
+    let validation = request
+        .job_context
+        .as_ref()
+        .and_then(|context| context.validation.as_ref())
+        .expect("one durable validation context");
+    assert_eq!(validation.steps.len(), 1);
+    assert_eq!(validation.effective_timeout_secs, 600);
+    assert_eq!(validation.sync_wait_secs, 1);
+    assert_eq!(
+        validation.steps[0].args,
+        [
+            "check",
+            "--all-targets",
+            "-p",
+            "package-a",
+            "-p",
+            "package-b",
+            "-p",
+            "package-c"
+        ]
+    );
+    assert!(probe_patch_agent_request(&runtime, client_id)
+        .await
+        .is_none());
+
+    runtime
+        .runner_registry
+        .update_job(cargo_test_update(
+            client_id,
+            &request.request_id,
+            &job_id,
+            "running",
+            "Checking package-a v0.1.0\n",
+            "",
+            None,
+            running_progress("check"),
+            false,
+        ))
+        .await
+        .unwrap();
+    let result = task.await.unwrap();
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(assert_sparse_pending_job_handoff(&result.output), job_id);
+    assert_eq!(request.timeout_secs, 600);
+    assert_eq!(runtime.runner_registry.list_jobs(Some(10)).await.len(), 1);
 }
 
 #[tokio::test]
@@ -1069,21 +1227,9 @@ async fn default_validation_handoff_beats_host_like_observation_deadline() {
         .expect("default handoff must return before the caller observation deadline")
         .unwrap();
     assert!(handoff.success, "{:?}", handoff.error);
-    assert_eq!(handoff.output["promoted_to_job"], true);
-    assert_eq!(
-        handoff.output["sync_wait_secs"],
-        STRUCTURED_EXECUTION_SYNC_WAIT_SECS
-    );
     assert_eq!(handoff.output["job_id"], job_id);
     assert_eq!(handoff.output["execution_state"], "running");
-    assert_eq!(handoff.output["command_started"], true);
-    assert_eq!(handoff.output["command_completed"], false);
-    assert_eq!(handoff.output["terminal"], false);
-    assert_eq!(handoff.output["continuation"]["tool"], "observe_jobs");
-    assert_eq!(
-        handoff.output["continuation"]["arguments"]["items"][0]["job_id"],
-        job_id
-    );
+    assert_observe_job_continuation(&handoff.output);
     assert!(
         probe_patch_agent_request(&runtime, client_id)
             .await
@@ -1167,45 +1313,14 @@ async fn long_cargo_test_hands_off_to_queryable_job() {
 
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["promoted_to_job"], true);
-    assert_eq!(result.output["execution_state"], "running");
-    assert_eq!(result.output["job_status"], "running");
-    assert_eq!(
-        result.output["activity"],
-        json!({
-            "state": "working",
-            "phase": "validation_test",
-            "source": "validation_plan"
-        })
-    );
-    assert_eq!(result.output["command_started"], true);
-    assert_eq!(result.output["command_completed"], false);
-    assert_eq!(result.output["effective_timeout_secs"], 1800);
-    assert_eq!(
-        result.output["sync_wait_secs"],
-        STRUCTURED_EXECUTION_SYNC_WAIT_SECS
-    );
-    assert!(result.output.get("passed").is_none());
-    assert!(result.output.get("failure_kind").is_none());
-    assert_eq!(result.output["job_id"].as_str().unwrap(), job_id.as_str());
-    assert_eq!(result.output["terminal"], false);
-    assert_eq!(result.output["continuation"]["tool"], "observe_jobs");
-    assert_eq!(
-        result.output["continuation"]["arguments"]["items"][0]["job_id"],
-        job_id
-    );
-    assert!(result.output["continuation"]["arguments"]["items"][0]
-        .get("after_observation_token")
-        .is_some());
-    let observation_token = result.output["observation_token"]
-        .as_str()
-        .expect("cargo_test handoff observation token")
-        .to_string();
+    assert_eq!(request.timeout_secs, 1800);
+    let observation_token = sparse_validation_handoff_token(&result.output, &job_id);
     let observed = runtime
         .observe_jobs_for_auth(
             vec![ObserveJobsItem {
                 job_id: job_id.clone(),
                 after_observation_token: Some(observation_token.clone()),
+                observation_ref: None,
             }],
             40,
             None,
@@ -1217,7 +1332,11 @@ async fn long_cargo_test_hands_off_to_queryable_job() {
     assert_eq!(observed.output["items"][0]["success"], true);
     assert_eq!(
         observed.output["items"][0]["output"]["activity"],
-        result.output["activity"]
+        json!({
+            "state": "working",
+            "phase": "validation_test",
+            "source": "validation_plan"
+        })
     );
     assert_agent_observation_upgrades_without_changing_snapshot(
         &job_id,
@@ -1234,7 +1353,14 @@ async fn long_cargo_test_hands_off_to_queryable_job() {
     assert!(status.success);
     assert_eq!(status.output["status"], "running");
     assert_eq!(status.output["active"], true);
-    assert_eq!(status.output["activity"], result.output["activity"]);
+    assert_eq!(
+        status.output["activity"],
+        json!({
+            "state": "working",
+            "phase": "validation_test",
+            "source": "validation_plan"
+        })
+    );
     assert_eq!(status.output["validation"]["tool"], "cargo_test");
     assert_eq!(status.output["validation"]["kind"], "test");
     assert_eq!(status.output["validation"]["state"], "running");
@@ -1246,13 +1372,21 @@ async fn long_cargo_test_hands_off_to_queryable_job() {
         .as_str()
         .unwrap_or("")
         .contains("running 1 test"));
-    assert_eq!(log.output["activity"], result.output["activity"]);
+    assert_eq!(
+        log.output["activity"],
+        json!({
+            "state": "working",
+            "phase": "validation_test",
+            "source": "validation_plan"
+        })
+    );
     assert_eq!(log.output["validation"], status.output["validation"]);
     let observed = runtime
         .observe_jobs_for_auth(
             vec![ObserveJobsItem {
                 job_id,
                 after_observation_token: Some(observation_token),
+                observation_ref: None,
             }],
             200,
             None,
@@ -1336,9 +1470,9 @@ async fn validation_command_starts_exactly_once_across_handoff() {
 
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["promoted_to_job"], true);
-    assert_eq!(result.output["sync_wait_secs"], 1);
     assert_eq!(result.output["job_id"], job_id);
+    assert_eq!(result.output["execution_state"], "running");
+    assert_observe_job_continuation(&result.output);
     let duplicate = runtime
         .runner_registry
         .poll(crate::runner_protocol::RunnerPollRequest {
@@ -1365,7 +1499,7 @@ async fn validation_command_starts_exactly_once_across_handoff() {
             &request.request_id,
             &job_id,
             "completed",
-            "running 1 test\n\ntest result: ok. 1 passed; 0 failed\n",
+            "\ntest result: ok. 1 passed; 0 failed\n",
             "",
             Some(0),
             completed_progress(),
@@ -1456,7 +1590,7 @@ async fn handoff_job_terminal_success_produces_passed_validation_summary() {
             &request.request_id,
             &job_id,
             "completed",
-            "running 3 tests\n\ntest result: ok. 3 passed; 0 failed; 0 ignored\n",
+            "\ntest result: ok. 3 passed; 0 failed; 0 ignored\n",
             "",
             Some(0),
             completed_progress(),
@@ -1611,7 +1745,7 @@ async fn e3_cargo_test_lib_handoff_arms_terminal_attention_without_polling() {
             &request.request_id,
             &job_id,
             "completed",
-            "running 1 test\n\ntest result: ok. 1 passed; 0 failed; 0 ignored\n",
+            "\ntest result: ok. 1 passed; 0 failed; 0 ignored\n",
             "",
             Some(0),
             completed_progress(),
@@ -1644,10 +1778,12 @@ async fn e3_cargo_test_lib_handoff_arms_terminal_attention_without_polling() {
                 items: vec![ObserveJobsItem {
                     job_id: job_id.clone(),
                     after_observation_token: None,
+                    observation_ref: None,
                 }],
                 tail_lines: 40,
                 wait_secs: None,
                 wake_on: ObserveJobsWakeOn::Terminal,
+                summary_only: false,
             },
             Some(&auth),
         )
@@ -1889,6 +2025,7 @@ async fn async_same_cargo_check_target_success_resolves_prior_failure_without_du
                         no_default_features: None,
                         features: None,
                         package: None,
+                        packages: None,
                         timeout_secs: Some(600),
                         sync_wait_secs: None,
                     },
@@ -1943,6 +2080,7 @@ async fn async_same_cargo_check_target_success_resolves_prior_failure_without_du
                         no_default_features: None,
                         features: None,
                         package: None,
+                        packages: None,
                         timeout_secs: Some(600),
                         sync_wait_secs: None,
                     },
@@ -2126,7 +2264,7 @@ async fn partial_agent_status_is_conservative_while_delta_log_uses_frozen_valida
     assert!(handoff.success, "{:?}", handoff.error);
     let _ = sparse_validation_handoff_token(&handoff.output, &job_id);
 
-    let mut stdout = String::from("running 3 tests\n");
+    let mut stdout = String::new();
     stdout.push_str(
         &(0..600)
             .map(|index| format!("progress line {index}\n"))
@@ -2166,7 +2304,7 @@ async fn partial_agent_status_is_conservative_while_delta_log_uses_frozen_valida
             &request.request_id,
             &job_id,
             "completed",
-            &stdout,
+            "",
             "",
             Some(0),
             completed_progress(),
@@ -2472,6 +2610,7 @@ async fn invalid_cargo_args_fail_before_command_or_agent_request() {
                 no_default_features: None,
                 features: Some("--no-run".to_string()),
                 package: None,
+                packages: None,
                 timeout_secs: Some(1800),
                 sync_wait_secs: None,
             },
@@ -2487,6 +2626,7 @@ async fn invalid_cargo_args_fail_before_command_or_agent_request() {
                 no_default_features: None,
                 features: None,
                 package: Some("--all-features".to_string()),
+                packages: None,
                 timeout_secs: Some(1800),
                 sync_wait_secs: None,
             },
@@ -2522,6 +2662,7 @@ async fn invalid_cargo_args_fail_before_command_or_agent_request() {
                 no_default_features: None,
                 features: Some("a".repeat(crate::runner_protocol::CARGO_VALUE_MAX_BYTES + 1)),
                 package: None,
+                packages: None,
                 timeout_secs: Some(1800),
                 sync_wait_secs: None,
             },
@@ -2780,7 +2921,7 @@ async fn cancel_running_before_handoff_retains_record_until_runner_stops() {
             &request.request_id,
             &job_id,
             "stopped",
-            "running 1 test\n",
+            "",
             "",
             None,
             completed_progress(),
@@ -3175,83 +3316,96 @@ fn cargo_output_schema_enforces_handoff_terminal_and_rejection_branches() {
     let handoff = json!({
         "success": true,
         "output": {
-            "command_summary": "cargo test",
-            "execution_state": "running",
-            "job_id": "job-123",
-            "job_status": "running",
-            "activity": {
-                "state": "working",
-                "phase": "validation_test",
-                "source": "validation_plan"
+            "execution_state": "pending",
+            "pending_strategy": {
+                "default": "continue_independent_work",
+                "passive_terminal_attention": "same_scope_may_surface",
+                "observe_continuation": "logs_details_recovery_fallback",
+                "observe_auto_follow": false,
+                "blocked_fallback": "wait_for_job_terminal"
             },
             "continuation": {
+                "follow_up_kind": "fallback_recovery",
                 "tool": "observe_jobs",
                 "arguments": {
                     "items": [{
                         "job_id": "job-123",
                         "after_observation_token": "observation"
                     }],
-                    "wait_secs": webcodex_core::runtime_contract::MODEL_JOB_CONTINUATION_WAIT_SECS,
+                    "wait_secs": webcodex_core::runtime_contract::DEFAULT_JOB_CONTINUATION_WAIT_SECS,
                     "wake_on": "terminal"
                 }
-            },
-            "effective_timeout_secs": 1800
+            }
         }
     });
-    assert!(accepts(&handoff), "handoff should validate");
+    assert!(accepts(&handoff), "sparse pending handoff should validate");
 
     for (name, mutate) in [
-        ("missing job_id", 0_u8),
-        ("null job_id", 1),
-        ("command_completed", 2),
-        ("terminal", 3),
-        ("passed", 4),
-        ("timeout failure", 5),
-        ("duplicate observation token", 6),
-        ("missing activity", 7),
-        ("missing continuation", 8),
-        ("redundant promoted flag", 9),
-        ("runtime-derived purpose", 10),
+        ("missing continuation", 0_u8),
+        ("legacy running state", 1),
+        ("repeated job_id", 2),
+        ("repeated job_status", 3),
+        ("repeated activity", 4),
+        ("repeated timeout budget", 5),
+        ("command_completed", 6),
+        ("terminal", 7),
+        ("passed", 8),
+        ("failure kind", 9),
+        ("duplicate observation token", 10),
+        ("redundant promoted flag", 11),
+        ("runtime-derived purpose", 12),
     ] {
         let mut invalid = handoff.clone();
         let output = invalid["output"].as_object_mut().unwrap();
         match mutate {
             0 => {
-                output.remove("job_id");
-            }
-            1 => {
-                output.insert("job_id".to_string(), serde_json::Value::Null);
-            }
-            2 => {
-                output.insert("command_completed".to_string(), json!(true));
-            }
-            3 => {
-                output.insert("terminal".to_string(), json!(true));
-            }
-            4 => {
-                output.insert("passed".to_string(), json!(false));
-            }
-            5 => {
-                output.insert("failure_kind".to_string(), json!("timeout"));
-            }
-            6 => {
-                output.insert("observation_token".to_string(), json!("observation"));
-            }
-            7 => {
-                output.remove("activity");
-            }
-            8 => {
                 output.remove("continuation");
             }
+            1 => {
+                output.insert("execution_state".to_string(), json!("running"));
+            }
+            2 => {
+                output.insert("job_id".to_string(), json!("job-123"));
+            }
+            3 => {
+                output.insert("job_status".to_string(), json!("running"));
+            }
+            4 => {
+                output.insert(
+                    "activity".to_string(),
+                    json!({"state":"working","phase":"validation_test","source":"validation_plan"}),
+                );
+            }
+            5 => {
+                output.insert("effective_timeout_secs".to_string(), json!(1800));
+            }
+            6 => {
+                output.insert("command_completed".to_string(), json!(false));
+            }
+            7 => {
+                output.insert("terminal".to_string(), json!(false));
+            }
+            8 => {
+                output.insert("passed".to_string(), json!(false));
+            }
             9 => {
-                output.insert("promoted_to_job".to_string(), json!(true));
+                output.insert("failure_kind".to_string(), json!("timeout"));
             }
             10 => {
+                output.insert("observation_token".to_string(), json!("observation"));
+            }
+            11 => {
+                output.insert("promoted_to_job".to_string(), json!(true));
+            }
+            12 => {
                 output.insert("purpose".to_string(), json!("test"));
             }
             _ => unreachable!(),
         }
-        assert!(!accepts(&invalid), "handoff misuse should fail: {name}");
+        assert!(
+            !accepts(&invalid),
+            "pending handoff misuse should fail: {name}"
+        );
     }
 
     let terminal = json!({

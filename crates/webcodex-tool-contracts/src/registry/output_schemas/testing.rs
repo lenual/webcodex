@@ -2,8 +2,8 @@ use serde_json::{json, Value};
 
 use super::common::{
     cargo_test_count_assertion_schema, job_activity_schema, nullable_schema,
-    observe_job_continuation_schema, open_object_schema, permission_decision_schema, schema_type,
-    session_hint_schema,
+    observe_job_continuation_schema, open_object_schema, pending_job_strategy_schema,
+    permission_decision_schema, schema_type, session_hint_schema,
 };
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
@@ -79,7 +79,7 @@ fn cargo_output_schema(tool_name: &str) -> Value {
             ),
             (
                 "execution_state",
-                schema_type("string", "not_started, outcome_unknown, completed, timed_out, queued, or running. not_started proves pre-execution rejection; outcome_unknown means side effects may have occurred and blind retry is unsafe; queued/running indicate promotion to a Job."),
+                schema_type("string", "pending, not_started, outcome_unknown, completed, or timed_out. pending is the normal same-execution durable handoff and carries one exact fallback continuation; not_started proves pre-execution rejection; outcome_unknown means side effects may have occurred and blind retry is unsafe."),
             ),
             (
                 "job_id",
@@ -111,6 +111,7 @@ fn cargo_output_schema(tool_name: &str) -> Value {
             ("async_handoff_available", schema_type("boolean", "Whether this Runner supports validation Job handoff.")),
             ("detected_summary", open_object_schema("Current bounded validation/progress summary at the initial durable Job handoff; advisory only and never retry authority.")),
             ("continuation", observe_job_continuation_schema()),
+            ("pending_strategy", pending_job_strategy_schema()),
             ("suggested_call", super::jobs::list_jobs_recovery_call_schema(true)),
             ("session_hint", session_hint_schema()),
             ("permission", permission_decision_schema()),
@@ -279,11 +280,9 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                     "success": {"const": true},
                     "error": {"type": "null"},
                     "output": {
-                        "required": [
-                            "command_summary", "execution_state", "job_id", "job_status",
-                            "activity", "continuation", "effective_timeout_secs"
-                        ],
+                        "required": ["execution_state", "continuation", "pending_strategy"],
                         "properties": {
+                            "execution_state": {"const": "pending"},
                             "promoted_to_job": {"enum": []},
                             "terminal": {"enum": []},
                             "command_started": {"enum": []},
@@ -294,9 +293,11 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "tool_failure": {"enum": []},
                             "project": {"enum": []},
                             "cwd": {"enum": []},
-                            "execution_state": {"enum": ["queued", "running"]},
-                            "job_id": {"type": "string", "minLength": 1},
-                            "job_status": {"type": "string", "minLength": 1},
+                            "command_summary": {"enum": []},
+                            "job_id": {"enum": []},
+                            "job_status": {"enum": []},
+                            "activity": {"enum": []},
+                            "effective_timeout_secs": {"enum": []},
                             "passed": {"enum": []},
                             "failure_kind": {"enum": []},
                             "warnings_count": {"enum": []},
@@ -476,7 +477,7 @@ fn cargo_output_schema(tool_name: &str) -> Value {
     })
 }
 
-fn cargo_test_diagnostics_schema(description: &str) -> Value {
+pub(super) fn cargo_test_diagnostics_schema(description: &str) -> Value {
     json!({
         "type": "object",
         "description": description,

@@ -71,6 +71,32 @@ fn rust_profile_selects_cargo_fmt_adapter_and_preserves_command() {
 }
 
 #[test]
+fn cargo_fmt_read_only_plan_excludes_mutating_format() {
+    let adapter = validation_adapter_for_tool("cargo_fmt").expect("cargo_fmt adapter");
+    let readonly = adapter
+        .build_readonly_plan(ValidationCommandOptions {
+            check: true,
+            ..ValidationCommandOptions::default()
+        })
+        .unwrap();
+    assert_eq!(readonly.compatibility_command, "cargo fmt -- --check");
+    assert_eq!(readonly.structured_step.name, "format");
+    assert_eq!(readonly.structured_step.program, "cargo");
+    assert_eq!(readonly.structured_step.args, ["fmt", "--", "--check"]);
+    assert!(readonly.structured_step.is_canonical());
+
+    assert!(adapter
+        .build_readonly_plan(ValidationCommandOptions::default())
+        .is_err());
+    assert_eq!(
+        adapter
+            .build_command(ValidationCommandOptions::default())
+            .unwrap(),
+        "cargo fmt"
+    );
+}
+
+#[test]
 fn rust_profile_selects_cargo_check_adapter_and_preserves_command() {
     let adapter = validation_adapter_for_tool("cargo_check").expect("cargo_check adapter");
     assert_eq!(adapter.tool_identity(), "cargo_check");
@@ -81,12 +107,47 @@ fn rust_profile_selects_cargo_check_adapter_and_preserves_command() {
             .unwrap(),
         "cargo check --all-targets"
     );
+    let legacy_single = adapter
+        .build_command(ValidationCommandOptions {
+            package: Some("webcodex".to_string()),
+            ..ValidationCommandOptions::default()
+        })
+        .unwrap();
+    let canonical_single = adapter
+        .build_command(ValidationCommandOptions {
+            cargo_packages: Some(vec!["webcodex".to_string()]),
+            ..ValidationCommandOptions::default()
+        })
+        .unwrap();
+    assert_eq!(legacy_single, "cargo check --all-targets -p 'webcodex'");
+    assert_eq!(legacy_single, canonical_single);
     assert!(adapter
         .build_command(ValidationCommandOptions {
             features: Some("feat\0x".to_string()),
             ..ValidationCommandOptions::default()
         })
         .is_err());
+}
+
+#[test]
+fn cargo_check_builds_one_command_with_repeated_package_selectors() {
+    let adapter = validation_adapter_for_tool("cargo_check").expect("cargo_check adapter");
+    let command = adapter
+        .build_command(ValidationCommandOptions {
+            cargo_packages: Some(vec![
+                "package-a".to_string(),
+                "package-b".to_string(),
+                "package-c".to_string(),
+            ]),
+            ..ValidationCommandOptions::default()
+        })
+        .unwrap();
+
+    assert_eq!(
+        command,
+        "cargo check --all-targets -p 'package-a' -p 'package-b' -p 'package-c'"
+    );
+    assert_eq!(command.matches("cargo check").count(), 1);
 }
 
 #[test]

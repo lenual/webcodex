@@ -3454,12 +3454,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams 0.4.2",
  "web-sys",
  "webpki-roots 1.0.7",
 ]
@@ -3501,7 +3503,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
+ "wasm-streams 0.5.0",
  "web-sys",
 ]
 
@@ -5228,6 +5230,19 @@ dependencies = [
 
 [[package]]
 name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
+name = "wasm-streams"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
@@ -5361,7 +5376,7 @@ dependencies = [
 
 [[package]]
 name = "webcodex"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "base64",
@@ -5392,6 +5407,7 @@ dependencies = [
  "webcodex-admin",
  "webcodex-code-mode",
  "webcodex-core",
+ "webcodex-environment",
  "webcodex-persistent-shell",
  "webcodex-runner-config",
  "webcodex-runner-registry",
@@ -5408,7 +5424,7 @@ dependencies = [
 
 [[package]]
 name = "webcodex-admin"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "reqwest 0.12.28",
  "serde_json",
@@ -5418,7 +5434,7 @@ dependencies = [
 
 [[package]]
 name = "webcodex-browser"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "base64",
  "reqwest 0.12.28",
@@ -5434,7 +5450,7 @@ dependencies = [
 
 [[package]]
 name = "webcodex-cli"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "chrono",
  "fs2",
@@ -5454,13 +5470,14 @@ dependencies = [
  "webcodex",
  "webcodex-admin",
  "webcodex-core",
+ "webcodex-environment",
  "webcodex-runner-config",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "webcodex-code-mode"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "deno_core_icudata",
  "serde",
@@ -5471,7 +5488,7 @@ dependencies = [
 
 [[package]]
 name = "webcodex-computer"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "base64",
  "block2",
@@ -5494,20 +5511,43 @@ dependencies = [
 
 [[package]]
 name = "webcodex-core"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "base64",
  "getrandom 0.3.4",
  "schemars 1.2.2",
  "serde",
  "serde_json",
+ "serde_norway",
  "sha2",
  "tokio",
 ]
 
 [[package]]
+name = "webcodex-environment"
+version = "0.4.3"
+dependencies = [
+ "fs2",
+ "libc",
+ "quick-xml",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+ "url",
+ "uuid",
+ "webcodex-admin",
+ "webcodex-core",
+ "webcodex-runner-config",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "webcodex-lsp"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "libc",
  "serde_json",
@@ -5523,7 +5563,7 @@ dependencies = [
 
 [[package]]
 name = "webcodex-persistent-shell"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "base64",
  "libc",
@@ -5535,7 +5575,7 @@ dependencies = [
 
 [[package]]
 name = "webcodex-process"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "libc",
  "tempfile",
@@ -5544,7 +5584,7 @@ dependencies = [
 
 [[package]]
 name = "webcodex-runner"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "agent-client-protocol-schema",
  "base64",
@@ -5570,6 +5610,7 @@ dependencies = [
  "webcodex-browser",
  "webcodex-computer",
  "webcodex-core",
+ "webcodex-environment",
  "webcodex-lsp",
  "webcodex-persistent-shell",
  "webcodex-process",
@@ -5583,7 +5624,7 @@ dependencies = [
 
 [[package]]
 name = "webcodex-runner-config"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "serde",
  "toml 0.8.23",
@@ -5592,9 +5633,10 @@ dependencies = [
 
 [[package]]
 name = "webcodex-runner-registry"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "chrono",
+ "serde",
  "serde_json",
  "sha2",
  "tokio",
@@ -5605,7 +5647,7 @@ dependencies = [
 
 [[package]]
 name = "webcodex-store"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5622,7 +5664,7 @@ dependencies = [
 
 [[package]]
 name = "webcodex-tool-contracts"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "regex",
  "schemars 1.2.2",
@@ -5633,7 +5675,7 @@ dependencies = [
 
 [[package]]
 name = "webcodex-tool-runtime-contracts"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -5645,7 +5687,7 @@ dependencies = [
 
 [[package]]
 name = "webcodex-validation"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -5660,7 +5702,7 @@ dependencies = [
 
 [[package]]
 name = "webcodex-workflow-session"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "base64",
  "chrono",
@@ -5677,7 +5719,7 @@ dependencies = [
 
 [[package]]
 name = "webcodex-workspace"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "serde",
  "serde_json",

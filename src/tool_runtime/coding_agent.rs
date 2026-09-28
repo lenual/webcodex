@@ -1,4 +1,4 @@
-use super::{RecoveryKind, ToolResult, ToolRuntime};
+use super::{RecoveryKind, SuggestedToolCall, ToolResult, ToolRuntime};
 use crate::auth::{AuthContext, AuthKind};
 use crate::json_digest::update_sha256_with_json;
 use crate::runner_http::RunnerFeature;
@@ -179,6 +179,17 @@ impl Default for CodingAgentServerState {
 }
 
 impl CodingAgentServerState {
+    pub(crate) async fn active_runs_for_maintenance(&self, client_id: Option<&str>) -> usize {
+        self.runs
+            .lock()
+            .await
+            .values()
+            .filter(|binding| {
+                client_id.is_none_or(|id| binding.client_id == id)
+                    && !binding.snapshot.state.terminal()
+            })
+            .count()
+    }
     fn with_observation_mac_key(observation_mac_key: [u8; OBSERVATION_MAC_KEY_BYTES]) -> Self {
         Self {
             epoch: webcodex_core::compact::random_bytes(),
@@ -429,13 +440,23 @@ impl ToolRuntime {
         {
             Some(provider) => provider.provider_instance_id.clone(),
             None => {
-                return Err(coding_agent_error(
+                let mut error = coding_agent_error(
                     "coding_agent_provider_unavailable",
-                    "logical ACP provider is not advertised by the exact Project Runner",
+                    "Logical ACP provider is not advertised by the exact Project Runner. Re-observe that Runner's coding_agent_providers; choose an advertised provider_id according to the user's instructions, not an executable from PATH.",
                     "not_started",
                     RecoveryKind::Reobserve,
                     Some(&run_id),
-                ))
+                );
+                error.output["available_providers"] =
+                    json!(webcodex_core::coding_agent::safe_provider_inventory(
+                        client.coding_agent_providers.as_deref()
+                    ));
+                error.output["suggested_call"] = SuggestedToolCall::fallback_recovery(
+                    "runtime_status",
+                    json!({"client_id": client.client_id, "compact": true}),
+                )
+                .to_value();
+                return Err(error);
             }
         };
         let timeout_secs = timeout_secs.unwrap_or(DEFAULT_RUN_TIMEOUT_SECS);
@@ -1816,6 +1837,7 @@ mod tests {
 
     fn test_shell_client() -> crate::runner_protocol::RunnerView {
         crate::runner_protocol::RunnerView {
+            computer_session_availability: None,
             client_id: "client".to_string(),
             runner_instance_id: "instance".to_string(),
             display_name: None,

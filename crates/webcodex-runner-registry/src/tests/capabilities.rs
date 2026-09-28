@@ -89,6 +89,8 @@ fn capability_classification_keeps_environment_dependent_features_registration_r
         RunnerFeature::StructuredScriptJavascript,
         RunnerFeature::StructuredScriptTypescript,
         RunnerFeature::ApplyTextEditLineScope,
+        RunnerFeature::ApplyTextEditRange,
+        RunnerFeature::ApplyTextEditExpectedMatchCount,
         RunnerFeature::ApplyTextEditLocalGuardWithoutSha,
         RunnerFeature::ApplyPatchMatchMetadata,
         RunnerFeature::ApplyPatchMatchingMode,
@@ -488,6 +490,21 @@ async fn coding_agent_registration_consistency_uses_canonical_feature_semantics(
     );
 }
 
+#[tokio::test]
+async fn old_runner_empty_provider_inventory_does_not_grant_coding_agent_capability() {
+    for providers in [None, Some(Vec::new())] {
+        let registry = RunnerRegistry::default();
+        let mut registration = runner_registration("old-runner", "old-instance", Vec::new());
+        registration.capabilities = v2_baseline_capabilities();
+        registration.coding_agent_providers = providers;
+        let view = registry.register(registration).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&view.capabilities).unwrap(),
+            serde_json::to_value(v2_baseline_capabilities()).unwrap()
+        );
+    }
+}
+
 async fn register_sticky_feature_state(
     registry: &RunnerRegistry,
     client_id: &str,
@@ -631,4 +648,47 @@ async fn canonical_sticky_feature_fence_preserves_allowed_reconnect_transitions(
     let view = replacement.get_runner_view("replacement").await.unwrap();
     assert_eq!(view.runner_instance_id, "inst-b");
     assert!(!view.capabilities.job_state_reconciliation);
+}
+
+#[tokio::test]
+async fn build_identity_never_substitutes_for_wire_or_optional_operation_capabilities() {
+    let registry = RunnerRegistry::default();
+    let mut advertised = v2_baseline_capabilities();
+    advertised = with_wire_feature(&advertised, RunnerFeature::Shell, true);
+    advertised = with_wire_feature(&advertised, RunnerFeature::FileRead, true);
+    advertised = with_wire_feature(&advertised, RunnerFeature::Git, true);
+    advertised = with_wire_feature(&advertised, RunnerFeature::ManagedSshResources, false);
+
+    let mut registration = runner_registration("mixed-build", "inst-a", Vec::new());
+    registration.capabilities = advertised;
+    registration.build = Some(RunnerBuildInfo {
+        version: Some("0.99.0".into()),
+        git_commit: Some("abcdef012345".into()),
+        git_dirty: Some(true),
+        built_at: Some("100".into()),
+        target: Some("aarch64-apple-darwin".into()),
+        architecture: Some("aarch64".into()),
+    });
+    registry
+        .register(current_runner_registration(registration))
+        .await
+        .unwrap();
+
+    let view = registry.get_runner_view("mixed-build").await.unwrap();
+    let build = view.build.as_ref().expect("registered build identity");
+    assert_eq!(build.version.as_deref(), Some("0.99.0"));
+    assert_eq!(build.git_commit.as_deref(), Some("abcdef012345"));
+    assert_eq!(build.git_dirty, Some(true));
+    assert_eq!(
+        webcodex_core::desktop_runtime_contract::runner_protocol_compatibility(
+            view.runner_protocol_generation.get()
+        ),
+        webcodex_core::desktop_runtime_contract::ProtocolCompatibility::Compatible
+    );
+
+    let features = RunnerFeatureSet::from_wire_for_test(&view.capabilities);
+    assert!(!features.supports(RunnerFeature::ManagedSshResources));
+    assert!(features.supports(RunnerFeature::Shell));
+    assert!(features.supports(RunnerFeature::FileRead));
+    assert!(features.supports(RunnerFeature::Git));
 }

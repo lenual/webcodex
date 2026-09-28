@@ -3,15 +3,15 @@ use crate::json_error;
 use crate::tool_request_trace::{
     estimate_json_bytes, new_trace_id, scope_active_trace, ToolRequestLifecycle,
 };
+#[cfg(feature = "legacy-gpt-actions")]
+use crate::tool_runtime::kernel::HostFileImportTrust;
 use crate::tool_runtime::kernel::{
-    HostFileImportTrust, ToolCallContext, ToolCallErrorStatus,
-    ToolCallRequest as KernelToolCallRequest, ToolTransport,
+    ToolCallContext, ToolCallErrorStatus, ToolCallRequest as KernelToolCallRequest, ToolTransport,
 };
 use crate::tool_runtime::model_ergonomics_telemetry::ModelErgonomicsCompletion;
 use crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD;
 use crate::tool_runtime::{
     ListToolsOptions, ToolCall, ToolRuntime, TOOL_CALL_PARAMS_FIELD, TOOL_CALL_TOOL_FIELD,
-    TOOL_CALL_WRAPPER_FIELDS,
 };
 use salvo::prelude::*;
 use serde_json::{json, Value};
@@ -246,10 +246,10 @@ pub async fn tools_call(req: &mut Request, depot: &mut Depot, res: &mut Response
         guard.handler_returned(500, estimated, Some(false), None, "error_runtime_missing");
         return;
     };
-    // Parse the body as a raw JSON value so we can apply the params/arguments
-    // precedence rule explicitly and emit field-aware errors that include the
-    // tool name. We never echo the raw body back, so tokens/headers/env never
-    // leak through error messages.
+    // Parse the body as a raw JSON value so we can enforce the explicit
+    // tool/params envelope and emit field-aware errors that include the tool
+    // name. We never echo the raw body back, so tokens/headers/env never leak
+    // through error messages.
     let body: Value = match req.parse_json().await {
         Ok(body) => body,
         Err(e) => {
@@ -482,25 +482,19 @@ fn tool_call_trace_effective_arguments(tool: &str, params: &Value) -> Value {
     }
 }
 
-/// Extract `(tool, params)` from the legacy generic REST `/api/tools/call` body.
+/// Extract `(tool, params)` from the generic REST `/api/tools/call` body.
 ///
-/// Accepted shapes (all route to the same tool dispatch):
+/// Accepted shapes:
 /// - `{"tool":"list_tools"}`
 /// - `{"tool":"list_tools","params":null}`
 /// - `{"tool":"show_changes","params":{"project":"agent:c:p"}}`
-/// - `{"tool":"show_changes","project":"agent:c:p"}`
-/// - `{"tool":"git_status","project":"agent:c:p","recording_session_id":"wc_sess_..."}`
+/// - `{"tool":"git_status","params":{"project":"agent:c:p"},"recording_session_id":"wc_sess_..."}`
 ///
-/// Non-null `params` take precedence over legacy flattened REST fields. A null
-/// `params` wrapper is treated as absent. When `params` is absent/null, every
-/// top-level field except `tool` and reserved metadata like
-/// `recording_session_id` is collected into the params object for REST
-/// compatibility. GPT Actions do not use this envelope. The retired `arguments`
-/// wrapper is rejected explicitly.
-/// Top-level `session_id` is not reserved here; it remains a normal flattened
-/// tool argument for tools such as `session_summary`. Returns a human-readable
-/// error string (never including the raw body) when the body is not a JSON
-/// object or `tool` is missing/not a non-empty string.
+/// `params` is the only tool-argument container. Top-level
+/// `recording_session_id` remains request metadata and is not injected into
+/// tool arguments. Unknown top-level fields fail with migration guidance. The
+/// retired `arguments` wrapper is rejected explicitly. Returns a human-readable
+/// error string (never including the raw body) when the body is invalid.
 fn extract_tool_call(body: &Value) -> Result<(String, Value), String> {
     let obj = body
         .as_object()
@@ -519,31 +513,35 @@ fn extract_tool_call(body: &Value) -> Result<(String, Value), String> {
         }
     };
     if obj.contains_key("arguments") {
-        return Err("field 'arguments' is no longer supported; use 'params' or flattened top-level tool arguments".to_string());
+        return Err(
+            "field 'arguments' is no longer supported; move tool arguments under 'params'"
+                .to_string(),
+        );
     }
-    // Non-null params take precedence over legacy flattened REST fields. Some
-    // clients emit optional object properties as explicit nulls, which must not
-    // erase valid flattened compatibility arguments.
-    let params = if let Some(params) = obj
+    let mut unexpected = obj
+        .keys()
+        .filter(|key| {
+            key.as_str() != TOOL_CALL_TOOL_FIELD
+                && key.as_str() != TOOL_CALL_PARAMS_FIELD
+                && key.as_str() != TOOL_CALL_RECORDING_SESSION_ID_FIELD
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    unexpected.sort();
+    if !unexpected.is_empty() {
+        let fields = unexpected
+            .iter()
+            .map(|field| format!("'{field}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "unexpected top-level field(s) {fields}; move tool arguments under 'params'"
+        ));
+    }
+    let params = obj
         .get(TOOL_CALL_PARAMS_FIELD)
-        .filter(|params| !params.is_null())
-    {
-        params.clone()
-    } else {
-        let mut flattened = serde_json::Map::new();
-        for (key, value) in obj {
-            if !TOOL_CALL_WRAPPER_FIELDS.contains(&key.as_str())
-                && key != TOOL_CALL_RECORDING_SESSION_ID_FIELD
-            {
-                flattened.insert(key.clone(), value.clone());
-            }
-        }
-        if flattened.is_empty() {
-            Value::Null
-        } else {
-            Value::Object(flattened)
-        }
-    };
+        .cloned()
+        .unwrap_or(Value::Null);
     Ok((tool, params))
 }
 
@@ -556,6 +554,7 @@ fn extract_recording_session_id(body: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+#[cfg(feature = "legacy-gpt-actions")]
 fn parse_gpt_action_gateway(body: Value) -> Result<(String, Value), String> {
     let mut object = body
         .as_object()
@@ -576,6 +575,7 @@ fn parse_gpt_action_gateway(body: Value) -> Result<(String, Value), String> {
     Ok((tool, arguments))
 }
 
+#[cfg(feature = "legacy-gpt-actions")]
 fn rewrite_gpt_action_file_params(arguments: &mut Value) -> Result<(), String> {
     let object = arguments
         .as_object_mut()
@@ -618,6 +618,7 @@ fn rewrite_gpt_action_file_params(arguments: &mut Value) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "legacy-gpt-actions")]
 fn gpt_action_admit_target(path_tool: &str, target: &str) -> Result<(), String> {
     use crate::model_surface::AdaptiveRuntimeGatewayTargetRoute;
 
@@ -656,6 +657,7 @@ fn gpt_action_admit_target(path_tool: &str, target: &str) -> Result<(), String> 
     }
 }
 
+#[cfg(feature = "legacy-gpt-actions")]
 fn gpt_action_suggested_tool_call_route(
     target: &str,
 ) -> crate::model_surface::SuggestedToolCallRoute {
@@ -674,6 +676,7 @@ fn gpt_action_suggested_tool_call_route(
     }
 }
 
+#[cfg(feature = "legacy-gpt-actions")]
 #[handler]
 pub async fn gpt_action_invoke(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let Some(path_tool) = req.param::<String>("tool_name") else {
@@ -844,7 +847,7 @@ pub async fn runtime_status(req: &mut Request, depot: &mut Depot, res: &mut Resp
     render_result(res, &audit, "runtime_status", None, result);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-gpt-actions"))]
 mod job_action_routing_tests {
     use super::*;
 

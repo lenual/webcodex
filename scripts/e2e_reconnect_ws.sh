@@ -8,9 +8,9 @@ set -euo pipefail
 #   1. Boots a real `webcodex-server` and `webcodex-runner` (WebSocket).
 #   2. Verifies the layered connection observations (runner_process /
 #      server_transport / server_registration / project_registry /
-#      connector_endpoint / last_successful_tool_call) carry the full
-#      observation contract, plus version_compatibility and the runner-reported
-#      shell profile dialect.
+#      last_successful_tool_call) carry the current compact observation
+#      contract, plus version_compatibility and the runner-reported shell
+#      profile dialect.
 #   3. Creates a durable coding-task session.
 #   4. Kills the runner: layers must degrade independently (stale
 #      registration is never reported ready) and a reconciliation-capable
@@ -246,7 +246,7 @@ wait_for_agent_online() {
     for _ in $(seq 1 60); do
         check_deadline
         local body; body="$(runtime_status || true)"
-        if [ "$(json_get "$body" output.agents.online_count)" = "1" ]; then
+        if [ "$(json_get "$body" output.runners.online_count)" = "1" ]; then
             echo "$body"
             return 0
         fi
@@ -259,7 +259,7 @@ wait_for_agent_offline() {
     for _ in $(seq 1 90); do
         check_deadline
         local body; body="$(runtime_status || true)"
-        if [ "$(json_get "$body" output.agents.online_count)" = "0" ]; then
+        if [ "$(json_get "$body" output.runners.online_count)" = "0" ]; then
             echo "$body"
             return 0
         fi
@@ -291,8 +291,6 @@ assert_eq "server_registration registered" \
     "$(json_get "$BODY" ${LAYERS_PREFIX}.server_registration.status)" "registered"
 assert_eq "project_registry registered" \
     "$(json_get "$BODY" ${LAYERS_PREFIX}.project_registry.status)" "registered"
-assert_eq "connector_endpoint honest not_configured" \
-    "$(json_get "$BODY" ${LAYERS_PREFIX}.connector_endpoint.status)" "not_configured"
 assert_eq "version_compatibility compatible" \
     "$(json_get "$BODY" output.version_compatibility.status)" "compatible"
 assert_nonempty "server build version reported" \
@@ -301,7 +299,7 @@ assert_eq "authority mode default trusted_agent" \
     "$(json_get "$BODY" output.authority.mode)" "trusted_agent"
 assert_eq "authority source default" "$(json_get "$BODY" output.authority.source)" "default"
 
-SHELL_DIALECT="$(json_get "$BODY" output.agents.clients.0.shell_profiles.default_dialect)"
+SHELL_DIALECT="$(json_get "$BODY" output.runners.clients.0.shell_profiles.default_dialect)"
 assert_nonempty "runner-reported shell default_dialect" "$SHELL_DIALECT"
 
 # ----------------------------------------------------------------------------
@@ -337,7 +335,7 @@ for layer_status in \
 done
 
 JOBS_BODY="$(observe_job "$JOB_ID")"
-JOB_STATE="$(json_get "$JOBS_BODY" output.items.0.output.status)"
+JOB_STATE="$(json_get "$JOBS_BODY" output.items.0.status)"
 assert_eq "in-flight reconciliation-capable job is recovering after crash" "$JOB_STATE" "recovering"
 
 # ----------------------------------------------------------------------------
@@ -357,10 +355,10 @@ assert_eq "project re-registered after runner restart" \
     "$(json_get "$BODY" ${LAYERS_PREFIX}.project_registry.status)" "registered"
 
 JOBS_BODY="$(observe_job "$JOB_ID")"
-JOB_STATE="$(json_get "$JOBS_BODY" output.items.0.output.status)"
+JOB_STATE="$(json_get "$JOBS_BODY" output.items.0.status)"
 assert_eq "replacement instance fences old recovering job to lost" "$JOB_STATE" "lost"
 assert_eq "replacement loss reason is runner_instance_replaced" \
-    "$(json_get "$JOBS_BODY" output.items.0.output.recovery_reason_code)" "runner_instance_replaced"
+    "$(json_get "$JOBS_BODY" output.items.0.recovery_reason_code)" "runner_instance_replaced"
 
 READ_BODY="$(api_post /api/tools/call "{\"tool\":\"read_files\",\"params\":{\"project\":\"${RUNTIME_PROJECT_ID}\",\"items\":[{\"path\":\"README.md\"}]}}")"
 assert_eq "calls recover after runner restart (no server restart)" \

@@ -165,12 +165,19 @@ async fn result_app_descriptor_and_resource_exposure_require_ui_operator_capabil
     assert_eq!(MCP_RESULT_UI_RESOURCE_URI, "ui://webcodex/changes/v2");
     assert_eq!(
         MCP_WORK_RESULT_UI_RESOURCE_URI,
-        "ui://webcodex/work-result/v1"
+        "ui://webcodex/work-result/v11"
     );
+    assert!(MCP_WORK_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/work-result/v9"));
+    assert!(MCP_WORK_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/work-result/v10"));
     assert!(MCP_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/changes/v1"));
     assert!(MCP_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/result/v1"));
     assert!(MCP_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/result/v2"));
     assert!(MCP_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/result/v3"));
+    assert!(MCP_WORK_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/work-result/v1"));
+    assert!(MCP_WORK_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/work-result/v2"));
+    assert!(MCP_WORK_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/work-result/v4"));
+    assert!(MCP_WORK_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/work-result/v5"));
+    assert!(MCP_WORK_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/work-result/v6"));
     assert!(mcp_result_app_resource_meta(None)["ui"]
         .get("domain")
         .is_none());
@@ -479,10 +486,10 @@ async fn server_mcp_apps_setting_disables_only_app_presentation() {
         rpc(
             "tools/call",
             Some(json!(3215)),
-            mcp_2026_ui_params(json!({
-                "name": "list_jobs",
-                "arguments": {"limit": 1}
-            })),
+            mcp_2026_ui_params(adaptive_runtime_gateway_params(
+                "list_jobs",
+                json!({"limit": 1}),
+            )),
         ),
         None,
         false,
@@ -668,7 +675,7 @@ fn observe_presentation_preserves_wait_uncertainty_and_unknown_job_without_log_b
                 "success": false,
                 "error_kind": "unknown_job",
                 "recovery_kind": "reobserve",
-                "suggested_call": {"tool": "list_jobs", "arguments": {}},
+                "suggested_call": {"follow_up_kind": "fallback_recovery", "tool": "list_jobs", "arguments": {}},
                 "error": "unbounded internal error text"
             }
         ],
@@ -692,7 +699,7 @@ fn observe_presentation_preserves_wait_uncertainty_and_unknown_job_without_log_b
     assert_eq!(meta["items"][1]["error_kind"], "unknown_job");
     assert_eq!(
         meta["items"][1]["suggested_call"],
-        json!({"tool": "list_jobs", "arguments": {}})
+        json!({"follow_up_kind": "fallback_recovery", "tool": "list_jobs", "arguments": {}})
     );
     let serialized = serde_json::to_string(meta).unwrap();
     for forbidden in [
@@ -1784,6 +1791,7 @@ async fn register_job_runner(runtime: &ToolRuntime, auth: &crate::auth::AuthCont
         .runner_registry
         .register_with_auth(
             crate::test_support::current_runner_registration(RunnerRegisterRequest {
+                computer_session_availability: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -1848,8 +1856,6 @@ async fn set_job_state(
             status: status.to_string(),
             stdout_chunk: Some("secret log body that presentation must not copy\n".to_string()),
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: finished.then_some(0),
             duration_ms: finished.then_some(25),
@@ -1901,10 +1907,8 @@ async fn complete_result_app_validation_job(
             job_id: request.job_id.clone().expect("validation Job id"),
             request_id: Some(request.request_id.clone()),
             status: "completed".to_string(),
-            stdout_chunk: None,
+            stdout_chunk: Some("Finished `dev` profile [unoptimized] target(s)\n".to_string()),
             stderr_chunk: None,
-            stdout_tail: Some("Finished `dev` profile [unoptimized] target(s)\n".to_string()),
-            stderr_tail: Some(String::new()),
             log_snapshot: None,
             exit_code: Some(0),
             duration_ms: Some(25),
@@ -2055,10 +2059,10 @@ async fn mcp_job_presentation_tracks_real_running_to_terminal_transition() {
         rpc(
             "tools/call",
             Some(json!(32101)),
-            mcp_2026_ui_params(json!({
-                "name": "list_jobs",
-                "arguments": {"project": "agent:result-app-runner:demo", "limit": 10}
-            })),
+            mcp_2026_ui_params(adaptive_runtime_gateway_params(
+                "list_jobs",
+                json!({"project": "agent:result-app-runner:demo", "limit": 10}),
+            )),
         ),
         Some(&auth),
     )
@@ -2078,10 +2082,10 @@ async fn mcp_job_presentation_tracks_real_running_to_terminal_transition() {
         rpc(
             "tools/call",
             Some(json!(32102)),
-            mcp_2026_params(json!({
-                "name": "list_jobs",
-                "arguments": {"project": "agent:result-app-runner:demo", "limit": 10}
-            })),
+            mcp_2026_params(adaptive_runtime_gateway_params(
+                "list_jobs",
+                json!({"project": "agent:result-app-runner:demo", "limit": 10}),
+            )),
         ),
         Some(&auth),
     )
@@ -2118,7 +2122,7 @@ async fn mcp_job_presentation_tracks_real_running_to_terminal_transition() {
     );
     assert_eq!(
         presentation(&unknown)["items"][0]["suggested_call"],
-        json!({"tool": "list_jobs", "arguments": {}})
+        json!({"follow_up_kind": "fallback_recovery", "tool": "call_runtime_tool", "arguments": {"tool": "list_jobs", "arguments": {}}})
     );
 
     assert!(runtime.runner_registry.remove_job_record(&job_id).await);
@@ -2355,11 +2359,36 @@ fn observe_jobs_item_limit_matches_presentation_bound() {
             .map(|index| ObserveJobsItem {
                 job_id: format!("job-{index}"),
                 after_observation_token: None,
+                observation_ref: None,
             })
             .collect(),
         tail_lines: 40,
         wait_secs: None,
         wake_on: Default::default(),
+        summary_only: false,
     };
     assert!(matches!(parsed, ToolCall::ObserveJobs { .. }));
+}
+
+#[test]
+fn mcp_job_recovery_presentation_accepts_exact_gateway_and_rejects_extra_arguments() {
+    for valid in [true, false] {
+        let mut call = json!({"follow_up_kind": "fallback_recovery", "tool": "call_runtime_tool", "arguments": {"tool": "list_jobs", "arguments": {}}});
+        if !valid {
+            call["arguments"]["arguments"]["unexpected"] = json!("private");
+        }
+        let canonical = ToolResult::ok(json!({"items": [{
+            "job_id": "missing", "success": false, "error_kind": "unknown_job",
+            "suggested_call": call
+        }]}));
+        let mut framed =
+            super::super::tools::mcp_runtime_tool_result("observe_jobs", false, canonical);
+        super::super::presentation::attach_result_app_presentation("observe_jobs", &mut framed);
+        let projected = &presentation(&framed)["items"][0];
+        if valid {
+            assert_eq!(projected["suggested_call"], call);
+        } else {
+            assert!(projected.get("suggested_call").is_none());
+        }
+    }
 }

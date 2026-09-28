@@ -10,6 +10,7 @@ mod capabilities;
 mod job_status;
 mod job_updates;
 mod jobs;
+mod maintenance;
 mod polling;
 mod project_inventory;
 mod projects;
@@ -127,10 +128,14 @@ pub use access::{DetachedInitiatorIdentity, RunnerAccess, RunnerAccessGroup};
 pub use capabilities::{RunnerFeature, RunnerFeatureSet};
 pub use job_status::job_status_is_active;
 pub use job_updates::{
-    JobLogWait, JobLogWaitOutcome, ShellJobLogObservation, ShellJobStartMetadata,
-    StructuredJobExecution,
+    JobAttentionSnapshot, JobLogWait, JobLogWaitOutcome, JobTelemetrySnapshot, JobValidationOutput,
+    ShellJobLogObservation, ShellJobStartMetadata, StructuredJobExecution,
+    MAX_JOB_TELEMETRY_SNAPSHOTS,
 };
 pub use jobs::{command_preview, process_preview, script_preview, COMMAND_PREVIEW_MAX_CHARS};
+pub use maintenance::{
+    MaintenanceGrant, MaintenanceScope, MaintenanceStore, SavedMaintenanceLease,
+};
 pub(crate) use protocol::AcceptedRunnerProtocol;
 pub use reconciliation::recovery_timeout_sweep;
 pub use registry::{
@@ -144,5 +149,6 @@ pub(crate) use registry::{
     MAX_RETIRED_INSTANCES_PER_RUNNER, ORDINARY_RESULT_STREAM_RETENTION_BYTES,
 };
 pub use requests::{EnqueueLspError, EnqueueRunnerSkillError};
+pub use state::{JobRecoveryPhase, JobRecoveryReason};
 pub use state::{RunnerSemanticView, ShellJobVisibility};
 pub use telemetry::{NoopRunnerRegistryTelemetry, RunnerRegistryTelemetry};

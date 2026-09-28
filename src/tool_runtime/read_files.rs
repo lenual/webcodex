@@ -78,7 +78,10 @@ fn plan_read_files(items: Vec<ReadFilesItem>) -> Vec<PlannedRead> {
             let merged_end = existing_end.max(end);
             let merged_lines = merged_end.saturating_sub(existing_start).saturating_add(1);
             let close_enough = start <= existing_end.saturating_add(READ_FILES_MERGE_GAP_LINES);
-            if close_enough && merged_lines <= READ_FILES_MAX_MERGED_LINES {
+            // Contained/identical ranges add no physical lines or bytes, even
+            // when the original caller range exceeds the union-planning cap.
+            if end <= existing_end || (close_enough && merged_lines <= READ_FILES_MAX_MERGED_LINES)
+            {
                 existing.item.limit = Some(merged_lines);
                 existing.members.push(member);
                 continue;
@@ -175,7 +178,7 @@ fn read_revision_target(
     }
 }
 
-fn stale_read_revision_failure(path: &str) -> ToolResult {
+pub(super) fn stale_read_revision_failure(path: &str) -> ToolResult {
     ToolResult::err_with_output(
         "read_file failed: stale_read_revision",
         json!({
@@ -314,7 +317,7 @@ pub(crate) fn add_actionable_read_continuations(
     if !next_items.is_empty() {
         output.insert(
             "suggested_call".to_string(),
-            SuggestedToolCall::new(
+            SuggestedToolCall::mechanically_followable(
                 "read_files",
                 read_files_suggested_arguments(
                     project,
@@ -836,14 +839,14 @@ impl ToolRuntime {
         deadline: Instant,
     ) -> Value {
         let mut result = self
-            .read_one_resolved_project_file(
-                &resolved.config,
+            .read_project_snapshot(
+                resolved,
                 runner_project_id,
                 runner_instance_id,
                 path.to_string(),
                 member.start_line,
                 member.limit,
-                false,
+                expected_sha256,
                 deadline,
             )
             .await;
@@ -873,26 +876,23 @@ impl ToolRuntime {
             .get("sha256")
             .and_then(Value::as_str)
             .map(|sha256| self.read_revisions.observe(target, sha256.to_string()));
-        let Some(mut member_output) = super::files::slice_read_file_success_output(
+        let member_result = super::files::slice_read_file_result(
             &output,
             member.start_line,
             member.limit,
             with_line_numbers,
             path,
-        ) else {
+        );
+        if !member_result.success {
             return json!({
                 "index": member.index,
                 "path": path,
                 "success": false,
-                "output": {
-                    "error_kind": "read_file_failed",
-                    "reason_code": "malformed_agent_response",
-                    "path": path,
-                    "state_changed": false,
-                },
-                "error": "read_file failed: malformed_agent_response",
+                "output": member_result.output,
+                "error": member_result.error,
             });
-        };
+        }
+        let mut member_output = member_result.output;
         if let Some(read_revision) = read_revision {
             if let Some(object) = member_output.as_object_mut() {
                 object.insert("read_revision".to_string(), json!(read_revision));
@@ -961,6 +961,9 @@ impl ToolRuntime {
         let planned_reads = plan_read_files(items.clone());
         let with_line_numbers = with_line_numbers.unwrap_or(false);
         let deadline = Instant::now() + self.read_files_deadline;
+        // This is one absolute batch latency/resource deadline shared by all
+        // planned reads. It is independent from any Runner execution lifetime
+        // and is never reset as concurrent groups make progress.
         // Capture the active Runner process before dispatch. A replacement that
         // races this batch therefore makes these handles unusable rather than
         // silently retargeting them to the replacement Runner.
@@ -992,7 +995,6 @@ impl ToolRuntime {
         // are actually in flight.
         let completed_groups: Vec<Vec<Value>> =
             stream::iter(planned_reads.into_iter().map(|planned| {
-                let project = &resolved.config;
                 let runner_project_id = runner_project_id.clone();
                 let runner_instance_id = runner_instance_id.clone();
                 async move {
@@ -1021,14 +1023,14 @@ impl ToolRuntime {
                         None => None,
                     };
                     let mut result = self
-                        .read_one_resolved_project_file(
-                            project,
+                        .read_project_snapshot(
+                            resolved,
                             &runner_project_id,
                             &runner_instance_id,
                             path.clone(),
                             item.start_line,
                             item.limit,
-                            false,
+                            expected_sha256.as_deref(),
                             deadline,
                         )
                         .await;
@@ -1072,7 +1074,20 @@ impl ToolRuntime {
 
                     // Only a successful physical union can replace its members.
                     // Ordinary read_files and all failures retain caller ranges.
-                    let members = if coalesced_output && result.success {
+                    // A plain union can fit while numbering/JSON projection
+                    // does not. In that case slice the original members from
+                    // the successful snapshot; no additional Runner read.
+                    let union_fits = coalesced_output
+                        && result.success
+                        && super::files::slice_read_file_result(
+                            &result.output,
+                            item.start_line,
+                            item.limit,
+                            with_line_numbers,
+                            &path,
+                        )
+                        .success;
+                    let members = if union_fits {
                         vec![PlannedReadMember {
                             index: members
                                 .iter()
@@ -1100,28 +1115,23 @@ impl ToolRuntime {
                         .into_iter()
                         .map(|member| {
                             if success {
-                                let Some(mut member_output) =
-                                    super::files::slice_read_file_success_output(
-                                        &output,
-                                        member.start_line,
-                                        member.limit,
-                                        with_line_numbers,
-                                        &path,
-                                    )
-                                else {
+                                let member_result = super::files::slice_read_file_result(
+                                    &output,
+                                    member.start_line,
+                                    member.limit,
+                                    with_line_numbers,
+                                    &path,
+                                );
+                                if !member_result.success {
                                     return json!({
                                         "index": member.index,
                                         "path": path,
                                         "success": false,
-                                        "output": {
-                                            "error_kind": "read_file_failed",
-                                            "reason_code": "malformed_agent_response",
-                                            "path": path,
-                                            "state_changed": false,
-                                        },
-                                        "error": "read_file failed: malformed_agent_response",
+                                        "output": member_result.output,
+                                        "error": member_result.error,
                                     });
-                                };
+                                }
+                                let mut member_output = member_result.output;
                                 if let Some(read_revision) = read_revision {
                                     if let Some(object) = member_output.as_object_mut() {
                                         object.insert(

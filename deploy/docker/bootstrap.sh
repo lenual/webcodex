@@ -588,8 +588,8 @@ wait_for_server_health() {
         health=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null || true)
         case "$health" in
             healthy)
-                compose_full exec -T webcodex curl -fsS http://127.0.0.1:8080/openapi.json >/dev/null \
-                    || fail "WebCodex healthcheck is healthy but /openapi.json verification failed"
+                compose_full exec -T webcodex curl -fsS http://127.0.0.1:8080/healthz >/dev/null \
+                    || fail "WebCodex healthcheck is healthy but /healthz verification failed"
                 write_receipt ServerHealthy "$ENV_DIGEST"
                 return 0
                 ;;
@@ -626,8 +626,7 @@ Installation receipt:    $RECEIPT_FILE
 
 Reverse-proxy upstream: http://127.0.0.1:$HOST_PORT
 Public URL:            $PUBLIC_URL
-Console:               $PUBLIC_URL/console
-OpenAPI:               $PUBLIC_URL/openapi.json
+Console:               $PUBLIC_URL/runtime
 MCP:                   $PUBLIC_URL/mcp
 
 This Compose stack runs webcodex-server only. It does not run webcodex-runner

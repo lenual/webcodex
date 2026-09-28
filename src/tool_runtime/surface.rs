@@ -12,15 +12,18 @@ use super::kernel::ToolProtocolCapabilities;
 use super::metadata::ToolAuthorityPolicy;
 #[cfg(feature = "experimental-code-mode")]
 use super::orchestration_host::is_server_owned_orchestration_argument;
-use super::registry::{registered_tool_specs, stateless_operator_extension_tool_specs};
+use super::registry::{
+    exact_manifest_specialist_tool_specs, registered_tool_specs,
+    stateless_operator_extension_tool_specs,
+};
 use super::runtime::ToolRuntime;
 use super::tool_definition::{
     available_tool_manifest_intent_names, is_model_visible_tool_name, resolve_tool_manifest_intent,
-    runtime_tool_category, runtime_tool_execution_contract, runtime_tool_metadata,
-    runtime_tool_operator_extension_family, ToolExecutionContract, ToolManifestIntent,
-    ToolOperatorExtensionFamily, TOOL_CATEGORY_ARTIFACT, TOOL_CATEGORY_EDIT, TOOL_CATEGORY_GIT,
-    TOOL_CATEGORY_PATCH, TOOL_CATEGORY_RUNTIME, TOOL_CATEGORY_SESSION, TOOL_CATEGORY_VALIDATION,
-    TOOL_DISCOVERY_GROUPS, TOOL_RECOMMENDED_FLOWS,
+    runtime_tool_category, runtime_tool_execution_contract, runtime_tool_host_orchestration_hint,
+    runtime_tool_metadata, runtime_tool_operator_extension_family, ToolExecutionContract,
+    ToolManifestIntent, ToolOperatorExtensionFamily, TOOL_CATEGORY_ARTIFACT, TOOL_CATEGORY_EDIT,
+    TOOL_CATEGORY_GIT, TOOL_CATEGORY_PATCH, TOOL_CATEGORY_RUNTIME, TOOL_CATEGORY_SESSION,
+    TOOL_CATEGORY_VALIDATION, TOOL_DISCOVERY_GROUPS, TOOL_RECOMMENDED_FLOWS,
 };
 use super::tool_inputs::ListToolsOptions;
 use super::tool_result::ToolResult;
@@ -234,6 +237,13 @@ fn collect_code_mode_output_fields(
         return;
     };
     for (name, child) in properties {
+        // Passive Job attention is an outer model-facing Window/Project/Session
+        // decoration. Nested Code Mode children have no Window and can never
+        // receive it, so projecting its fields would teach an impossible child
+        // result shape and needlessly consume the callable-contract budget.
+        if prefix == "output" && name == "job_attention" {
+            continue;
+        }
         let path = if prefix.is_empty() {
             name.to_string()
         } else {
@@ -297,9 +307,9 @@ text({status:status.output?.stdout,file:detail.output.items?.[0]?.output?.text})
         CodeModeCallableStage::ReadOnly => {}
         CodeModeCallableStage::Validation => examples.push(json!({
             "name": "validation_job_handoff",
-            "source": r#"const check = await tools.cargo_check({sync_wait_secs:1});
-if (!check.output?.terminal && check.output?.job_id) {
-  text({job_id:check.output.job_id,continuation:check.output.continuation});
+            "source": r#"const check = await tools.cargo_check({});
+if (check.output?.execution_state === "pending") {
+  text({execution_state:"pending",continuation:check.output.continuation});
 } else {
   text({passed:check.output?.passed,failure_kind:check.output?.failure_kind,diagnostics:check.output?.diagnostics});
 }"#,
@@ -309,10 +319,10 @@ if (!check.output?.terminal && check.output?.job_id) {
             "source": r#"const path = "src/example.rs";
 const read = await tools.read_files({items:[{path,start_line:1,limit:120}]});
 const revision = read.output.items?.[0]?.output?.read_revision;
-const edit = await tools.apply_text_edits({changes:[{path,old_text:"old",new_text:"new",expected_read_revision:revision}]});
+const edit = await tools.edit_project_files({changes:[{kind:"edit",path,expected_read_revision:revision,edits:[{kind:"replace_exact",old_text:"old",new_text:"new"}]}]});
 if (!edit.success || typeof edit.output?.state_changed !== "boolean") throw new Error("inspect edit recovery before validating");
-const check = await tools.cargo_check({sync_wait_secs:1});
-text({state_changed:edit.output.state_changed,call_success:check.success,source_state:check.output?.source_state,job_handoff:!!check.output?.job_id});"#,
+const check = await tools.cargo_check({});
+text({state_changed:edit.output.state_changed,call_success:check.success,source_state:check.output?.source_state,pending:check.output?.execution_state==="pending"});"#,
         })),
     }
     examples
@@ -359,7 +369,6 @@ fn code_mode_callable_contract(
         "constraints": {
             "max_mutation_calls": policy.max_mutation_calls,
             "validation_after_successful_known_mutation": policy.validation_after_mutation,
-            "nested_sync_wait_max_secs": policy.nested_sync_wait_max_secs,
         },
         "tool_count": tools.len(),
         "tools": tools,
@@ -394,6 +403,9 @@ pub(crate) fn registered_tool_categories() -> Value {
             .filter(|name| is_model_visible_tool_name(name))
             .map(|name| Value::String((*name).to_string()))
             .collect::<Vec<_>>();
+        if tools.is_empty() {
+            continue;
+        }
         categories.insert(group.name.to_string(), Value::Array(tools));
     }
     Value::Object(categories)
@@ -447,6 +459,54 @@ fn tool_manifest_route(spec: &ToolSpec) -> (&'static str, Option<&'static str>) 
             true,
         )
     }
+}
+
+fn tool_manifest_invocation_route(spec: &ToolSpec) -> Value {
+    let target = spec.name.as_str();
+    let (availability, gateway_tool) = tool_manifest_route(spec);
+    let primary = match (availability, gateway_tool) {
+        (crate::model_surface::TOOL_SURFACE_AVAILABILITY_DIRECT, None) => {
+            json!({"mode": "direct", "tool": target})
+        }
+        (crate::model_surface::TOOL_SURFACE_AVAILABILITY_GATEWAY, Some(gateway)) => {
+            json!({"mode": "gateway", "tool": gateway, "target": target})
+        }
+        _ => json!({"mode": "unavailable", "tool": Value::Null, "target": target}),
+    };
+
+    let fallback = if availability == crate::model_surface::TOOL_SURFACE_AVAILABILITY_DIRECT
+        && target != crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+    {
+        json!({
+            "mode": "gateway",
+            "tool": crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+            "target": target,
+            "when": "direct_callable_unavailable",
+            "blocked_when_mcp_apps_enabled": crate::model_surface::tool_requires_direct_app_presentation(target),
+        })
+    } else {
+        Value::Null
+    };
+
+    json!({
+        "primary": primary,
+        "fallback": fallback,
+        "tool_manifest_registers_host_tool": false,
+        "discovery_effect": "none",
+    })
+}
+
+fn manifest_host_orchestration_projection(tool_name: &str) -> Option<Value> {
+    let hint = runtime_tool_host_orchestration_hint(tool_name);
+    if hint.is_unspecified() {
+        return None;
+    }
+    Some(json!({
+        "guidance_only": true,
+        "concurrency": hint.concurrency.as_str(),
+        "native_batch_field": hint.native_batch_field,
+        "compound_preferred": hint.compound_preferred,
+    }))
 }
 
 impl ToolRuntime {
@@ -585,8 +645,13 @@ impl ToolRuntime {
             return Err(unknown_tool_manifest_tool_result(tool_name));
         }
         let specs = tool_manifest_specs(protocol_capabilities);
+        let specialist_specs = exact_manifest_specialist_tool_specs();
         let tool_count = specs.len();
-        let Some(spec) = specs.iter().find(|spec| spec.name == tool_name) else {
+        let Some(spec) = specs
+            .iter()
+            .chain(specialist_specs.iter())
+            .find(|spec| spec.name == tool_name)
+        else {
             return Err(unknown_tool_manifest_tool_result(tool_name));
         };
         let category = runtime_tool_category(spec.name.as_str());
@@ -602,6 +667,7 @@ impl ToolRuntime {
             "total_count": tool_count,
             "filtered_count": 1,
             "tool_name": spec.name,
+            "route": tool_manifest_invocation_route(spec),
             "contract": {
                 "name": spec.name,
                 "description": spec.description,
@@ -626,9 +692,14 @@ impl ToolRuntime {
             "requested_limit": Value::Null,
             "categories": Value::Object(exact_categories),
             "tools": [compact_manifest_tool_entry(spec)],
+            "routing_note": "tool_manifest only describes an existing route; it never dynamically registers a new Host tool. Follow route.primary, or route.fallback when the direct callable is unavailable and the fallback is not blocked by MCP App presentation requirements.",
         });
         if let Some(execution) = runtime_tool_execution_contract(spec.name.as_str()) {
             output["contract"]["execution"] = manifest_execution_projection(execution);
+        }
+        if let Some(host_orchestration) = manifest_host_orchestration_projection(spec.name.as_str())
+        {
+            output["host_orchestration"] = host_orchestration;
         }
         if include_risk_summary {
             output["risk_summary"] = build_risk_summary(&[spec]);

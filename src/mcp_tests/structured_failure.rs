@@ -175,11 +175,12 @@ fn resource_failure_fallbacks_use_canonical_presentation_policy() {
                 json!({"execution_state": "outcome_unknown", "recovery": "inspect state"}),
             )
         };
-        let expected = mcp_runtime_tool_result_fallback(failed(), policy);
+        let expected = mcp_runtime_tool_result_fallback(failed(), false, policy);
         assert_eq!(
             mcp_artifact_export_tool_result(
                 failed(),
                 McpArtifactExportCallerBinding::Bootstrap,
+                false,
                 policy
             ),
             expected
@@ -190,7 +191,14 @@ fn resource_failure_fallbacks_use_canonical_presentation_policy() {
             "read_project_artifact",
         ] {
             assert_eq!(
-                mcp_runtime_tool_result_with_snapshot_resource(tool, true, failed(), None, policy),
+                mcp_runtime_tool_result_with_snapshot_resource(
+                    tool,
+                    true,
+                    failed(),
+                    None,
+                    false,
+                    policy,
+                ),
                 expected
             );
             let invalid_image = mcp_runtime_tool_result_with_snapshot_resource(
@@ -198,6 +206,7 @@ fn resource_failure_fallbacks_use_canonical_presentation_policy() {
                 true,
                 ToolResult::ok(json!({})),
                 None,
+                false,
                 policy,
             );
             assert_eq!(invalid_image["structuredContent"]["success"], false);
@@ -209,6 +218,7 @@ fn resource_failure_fallbacks_use_canonical_presentation_policy() {
         let invalid_export = mcp_artifact_export_tool_result(
             ToolResult::ok(json!({})),
             McpArtifactExportCallerBinding::Bootstrap,
+            false,
             policy,
         );
         assert_eq!(invalid_export["structuredContent"]["success"], false);
@@ -231,7 +241,7 @@ async fn gateway_and_app_canonical_failures_use_request_presentation() {
             json!({"project": "agent:missing:missing"}),
         ),
         adaptive_runtime_gateway_params("unknown_target", json!({})),
-        json!({"name": "goal_plan_state", "arguments": {"goal_id": "wc_goal_AAAAAAAAAAAAAAAA"}}),
+        json!({"name": "goal_plan_sync", "arguments": {"goal_id": "wc_goal_AAAAAAAAAAAAAAAA"}}),
         json!({"name": "agent_continuation_state", "arguments": {
             "agent_id": "wc_dagent_AAAAAAAAAAAAAAAA", "endpoint_id": "wc_endpoint_AAAAAAAAAAAAAAAA",
             "expected_controller_generation": 1, "binding_id": "wc_host_binding_AAAAAAAAAAAAAAAAAAAAAA"
@@ -275,6 +285,7 @@ async fn register_failure_runner(runtime: &ToolRuntime) {
         .runner_registry
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
+                computer_session_availability: None,
                 client_id: "failure-runner".into(),
                 runner_instance_id: "inst".into(),
                 runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
@@ -359,7 +370,7 @@ async fn wait_for_failure_request(runtime: &ToolRuntime) -> crate::runner_protoc
 
 async fn complete_failure_request(runtime: &ToolRuntime, tool: &str) {
     let request = wait_for_failure_request(runtime).await;
-    let edit = tool == "apply_text_edits";
+    let edit = tool == "edit_project_files";
     assert_eq!(
         request.kind,
         if edit {
@@ -623,15 +634,39 @@ async fn http_mcp_passthrough_preserves_mixed_image_content_order() {
     }
 }
 
+async fn seed_failure_edit_revision(runtime: &ToolRuntime) -> u64 {
+    let resolved = runtime
+        .resolve_project_input("agent:failure-runner:probe")
+        .await
+        .unwrap();
+    let runner = runtime
+        .runner_registry
+        .get_runner_view(&resolved.config.client_id)
+        .await
+        .expect("failure Runner");
+    runtime.read_revisions.observe(
+        crate::tool_runtime::ReadRevisionTarget {
+            project_id: resolved.resolved_id,
+            path: "probe.txt".to_string(),
+            client_id: resolved.config.client_id,
+            runner_instance_id: runner.runner_instance_id,
+            project_root: resolved.config.path,
+            root_fingerprint: resolved.root_fingerprint,
+        },
+        "a".repeat(64),
+    )
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn http_apply_text_edits_and_process_failures_preserve_canonical_output() {
+async fn http_edit_project_files_and_process_failures_preserve_canonical_output() {
     let _env = crate::auth::AuthEnvGuard::new();
     _env.enable_direct_shared_key();
     _env.disable_open_anonymous();
     let (_tmp, db) = test_db();
     let runtime = Arc::new(test_runtime());
     register_failure_runner(&runtime).await;
+    let edit_revision = seed_failure_edit_revision(&runtime).await;
     let service = Service::new(build_test_router(
         test_config(Some("secret")),
         db,
@@ -639,8 +674,8 @@ async fn http_apply_text_edits_and_process_failures_preserve_canonical_output() 
     ));
     for (tool, arguments) in [
         (
-            "apply_text_edits",
-            json!({"project": "agent:failure-runner:probe", "changes": [{"kind": "edit", "path": "probe.txt", "edits": [{"kind": "replace_exact", "old_text": "dup", "new_text": "replacement"}]}]}),
+            "edit_project_files",
+            json!({"project": "agent:failure-runner:probe", "changes": [{"kind": "edit", "path": "probe.txt", "expected_read_revision": edit_revision, "edits": [{"kind": "replace_exact", "old_text": "dup", "new_text": "replacement"}]}]}),
         ),
         (
             "run_process",
@@ -661,19 +696,21 @@ async fn http_apply_text_edits_and_process_failures_preserve_canonical_output() 
             let (status, mut body) = response;
             assert_eq!(status, StatusCode::OK, "{body}");
             let output = assert_failure(&body, client != "openai-mcp");
-            if tool == "apply_text_edits" {
+            if tool == "edit_project_files" {
                 assert_eq!(output["error_kind"], "multiple_matches");
                 assert_eq!(output["state_changed"], false);
                 assert_eq!(output["execution_state"], "not_started");
                 assert_eq!(output["match_count"], 2);
                 assert_eq!(
                     output["candidate_ranges"],
-                    json!([{"start_line": 10, "end_line": 10}, {"start_line": 20, "end_line": 20}])
+                    json!([
+                        {"occurrence": 1, "start_line": 10, "end_line": 10},
+                        {"occurrence": 2, "start_line": 20, "end_line": 20}
+                    ])
                 );
-                assert_eq!(output["recovery"]["tool"], "read_files");
-                assert_eq!(
-                    output["recovery"]["arguments"]["items"][0]["path"],
-                    "probe.txt"
+                assert!(
+                    output.get("recovery").is_none(),
+                    "same guarded snapshot can retry by occurrence/range without rereading"
                 );
             } else {
                 assert_eq!(output["execution_state"], "completed");

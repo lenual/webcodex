@@ -22,7 +22,7 @@ fn process_argv_helper() -> PathBuf {
         .get_or_init(|| {
             let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../tests/fixtures/process_argv_helper.rs");
-            let temp = tempfile::tempdir().unwrap();
+            let temp = crate::tests::executable_tempdir();
             let output = temp.path().join(format!(
                 "process-argv-helper{}",
                 std::env::consts::EXE_SUFFIX
@@ -392,7 +392,7 @@ fn internal_posix_runtime_uses_git_bash_stdin_with_powershell_configured() {
 fn internal_posix_runtime_ignores_configured_shell_on_posix_hosts() {
     use std::os::unix::fs::PermissionsExt;
 
-    let cwd = tempfile::tempdir().unwrap();
+    let cwd = crate::tests::executable_tempdir();
     let project_registry_dir = tempfile::tempdir().unwrap();
     let marker = cwd.path().join("configured-shell-ran");
     let configured_shell = cwd.path().join("configured-shell");
@@ -689,6 +689,8 @@ fn pre_spawn_rejection_is_not_started() {
         None,
         "exit 0",
         None,
+        false,
+        None,
         10,
         None,
     );
@@ -708,6 +710,8 @@ fn terminal_process_result_is_completed() {
         None,
         None,
         "exit 7",
+        None,
+        false,
         None,
         10,
         None,
@@ -729,6 +733,8 @@ fn known_process_timeout_is_timed_out() {
         None,
         None,
         "sleep 2",
+        None,
+        false,
         None,
         1,
         None,
@@ -752,6 +758,34 @@ fn post_spawn_missing_output_pipe_is_outcome_unknown() {
         result.execution_state,
         ShellCommandExecutionState::OutcomeUnknown
     );
+}
+
+#[test]
+fn explicit_bash_uses_resolved_interpreter_instead_of_configured_powershell() {
+    let temp = crate::tests::executable_tempdir();
+    let fake_bash = temp
+        .path()
+        .join(format!("bash{}", std::env::consts::EXE_SUFFIX));
+    create_fake_native_executable(&fake_bash);
+    let shell = ShellConfig {
+        program: "powershell".to_string(),
+        args: vec!["-NoProfile".to_string(), "-Command".to_string()],
+        dialect: Some(ShellDialect::PowerShell),
+        path_prepend: vec![temp.path().to_path_buf()],
+        ..Default::default()
+    };
+    let body = "printf '%s\\n' explicit-shell-ok";
+
+    let command =
+        configured_explicit_shell_command(&shell, None, ExecutionShell::Bash, false, body).unwrap();
+
+    assert_eq!(Path::new(command.get_program()), fake_bash.as_path());
+    let args = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(args, vec!["-c".to_string(), body.to_string()]);
+    assert!(args.iter().all(|arg| !arg.starts_with("exec bash -c ")));
 }
 
 #[test]
@@ -824,7 +858,7 @@ fn structured_process_supports_empty_args_and_bounded_stdin() {
 fn structured_process_without_stdin_receives_eof_instead_of_runner_parent_lease() {
     let cwd = tempfile::tempdir().unwrap();
     let helper = process_argv_helper();
-    let result = run_direct_process(cwd.path(), &helper, &["stdin".to_string()], None, 2);
+    let result = run_direct_process(cwd.path(), &helper, &["stdin".to_string()], None, 10);
     assert_eq!(
         result.execution_state,
         ShellCommandExecutionState::Completed,
@@ -1352,7 +1386,7 @@ fn missing_typescript_interpreter_is_prestart_and_does_not_run_script() {
 
 #[test]
 fn javascript_interpreter_resolves_node_from_prepared_profile_path() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::tests::executable_tempdir();
     let node = temp
         .path()
         .join(format!("node{}", std::env::consts::EXE_SUFFIX));
@@ -1379,7 +1413,7 @@ fn javascript_interpreter_resolves_node_from_prepared_profile_path() {
 
 #[test]
 fn typescript_interpreter_resolves_the_same_node_candidate() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::tests::executable_tempdir();
     let node = temp
         .path()
         .join(format!("node{}", std::env::consts::EXE_SUFFIX));
@@ -1405,7 +1439,7 @@ fn typescript_interpreter_resolves_the_same_node_candidate() {
 
 #[test]
 fn javascript_interpreter_accepts_configured_node_executable() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::tests::executable_tempdir();
     let node = temp
         .path()
         .join(format!("node{}", std::env::consts::EXE_SUFFIX));
@@ -1423,7 +1457,7 @@ fn javascript_interpreter_accepts_configured_node_executable() {
 
 #[test]
 fn node_script_languages_do_not_fallback_to_alternate_runtimes() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::tests::executable_tempdir();
     for runtime in ["bun", "deno", "tsx", "npx", "npm"] {
         create_fake_native_executable(
             &temp
@@ -1456,7 +1490,7 @@ fn node_script_languages_do_not_fallback_to_alternate_runtimes() {
 fn arbitrary_configured_shell_is_not_treated_as_a_script_language() {
     use std::os::unix::fs::PermissionsExt;
 
-    let cwd = tempfile::tempdir().unwrap();
+    let cwd = crate::tests::executable_tempdir();
     let marker = cwd.path().join("custom-shell-ran");
     let custom_shell = cwd.path().join("custom-shell");
     std::fs::write(
@@ -1718,6 +1752,112 @@ fn javascript_temp_file_uses_mjs_and_exact_script_bytes() {
 }
 
 #[test]
+fn python_script_uses_runner_resolved_interpreter_and_py_file() {
+    use std::ffi::OsStr;
+    let temp = crate::tests::executable_tempdir();
+    let candidate = if cfg!(windows) { "python" } else { "python3" };
+    let interpreter = temp
+        .path()
+        .join(format!("{candidate}{}", std::env::consts::EXE_SUFFIX));
+    create_fake_native_executable(&interpreter);
+    let mut shell = ShellConfig::default();
+    shell.program = "unrelated-shell".to_string();
+    shell.env.insert(
+        "PATH".to_string(),
+        temp.path().to_string_lossy().into_owned(),
+    );
+    let plan = configured_script_runtime_plan(
+        &shell,
+        None,
+        ShellScriptLanguage::Python,
+        temp.path(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(PathBuf::from(&plan.program), interpreter);
+    assert!(plan.prefix_args.is_empty());
+    let payload = ShellScriptPayload {
+        language: ShellScriptLanguage::Python,
+        script: "print('雪')\n".to_string(),
+        args: vec!["two words".to_string(), "$(literal)".to_string()],
+    };
+    let (temporary_path, _original, absolute) = create_temporary_script(&payload).unwrap();
+    assert_eq!(
+        absolute.extension().and_then(|value| value.to_str()),
+        Some("py")
+    );
+    assert_eq!(std::fs::read(&absolute).unwrap(), payload.script.as_bytes());
+    let command = build_script_command(&plan, &absolute, &payload.args);
+    let argv = command.get_args().collect::<Vec<_>>();
+    assert_eq!(
+        argv,
+        vec![
+            absolute.as_os_str(),
+            OsStr::new("two words"),
+            OsStr::new("$(literal)")
+        ]
+    );
+    temporary_path.close().unwrap();
+}
+
+#[test]
+fn python_script_rejects_missing_interpreter_before_start() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut shell = ShellConfig::default();
+    shell.program = "unrelated-shell".to_string();
+    shell.env.insert(
+        "PATH".to_string(),
+        temp.path().to_string_lossy().into_owned(),
+    );
+    let error = configured_script_runtime_plan(
+        &shell,
+        None,
+        ShellScriptLanguage::Python,
+        temp.path(),
+        None,
+    )
+    .unwrap_err();
+    assert!(error.contains("interpreter_unavailable: python"));
+    assert!(error.contains("command was not started"));
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_bash_login_reads_isolated_profile() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join(".bash_profile"),
+        "export WEBCODEX_LOGIN_FIXTURE=loaded\n",
+    )
+    .unwrap();
+    let mut shell = ShellConfig::default();
+    shell.env.insert(
+        "HOME".to_string(),
+        temp.path().to_string_lossy().into_owned(),
+    );
+    for (login, expected) in [(false, "absent"), (true, "loaded")] {
+        let mut command = configured_explicit_shell_command(
+            &shell,
+            None,
+            ExecutionShell::Bash,
+            login,
+            "printf '%s' \"${WEBCODEX_LOGIN_FIXTURE:-absent}\"; shopt -q login_shell",
+        )
+        .unwrap();
+        let output = command
+            .current_dir(temp.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), login);
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    }
+    assert!(
+        configured_explicit_shell_command(&shell, None, ExecutionShell::Sh, true, "true").is_err()
+    );
+}
+
+#[test]
 fn typescript_temp_file_uses_mts_and_exact_script_bytes() {
     let payload = ShellScriptPayload {
         language: ShellScriptLanguage::Typescript,
@@ -1807,7 +1947,7 @@ fn runner_real_process_typescript_probe_receives_eof_instead_of_runner_stdin() {
     }
 
     use std::os::unix::fs::PermissionsExt;
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::tests::executable_tempdir();
     let node = root.path().join("node");
     std::fs::write(
         &node,
@@ -1998,8 +2138,11 @@ fn phase_f_windows_powershell_shell_and_param_script_keep_semantics() {
         Some(cwd.path().to_string_lossy().as_ref()),
         "[Console]::Out.WriteLine('shell 中文 🙂'); [Console]::Error.WriteLine('error 中文 🙂'); exit 19",
         None,
+        false,
+        None,
         10,
-        None,);
+        None,
+    );
     assert_eq!(
         shell_result.execution_state,
         ShellCommandExecutionState::Completed

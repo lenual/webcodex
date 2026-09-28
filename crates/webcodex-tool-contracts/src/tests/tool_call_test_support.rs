@@ -38,7 +38,7 @@ fn sample_tool_args_for_spec(spec: &ToolSpec) -> Value {
         "work_on_project" => {
             args.insert("project".to_string(), json!(SAMPLE_PROJECT));
         }
-        "update_goal" => {
+        "update_goal" | "checkpoint_goal" => {
             args.insert("expected_revision".to_string(), json!(1));
         }
         "observe_jobs" => {
@@ -97,6 +97,7 @@ fn sample_field_value(field: &str) -> Value {
         "content" => json!("fn main() {}\n"),
         "instruction" => json!("implement the requested change"),
         "objective" => json!("Preserve durable high-level intent without execution authority."),
+        "summary" => json!("Recovery-worthy checkpoint summary"),
         "title" => json!("Durable agent work"),
         "content_base64" => json!("AA=="),
         "openaiFileIdRefs" => json!([{
@@ -115,6 +116,8 @@ fn sample_field_value(field: &str) -> Value {
         "prompt" => json!("summarize"),
         "query" => json!("ToolRuntime"),
         "diff" => json!("diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b\n"),
+        "adapter_id" | "event_id" => json!("a".repeat(64)),
+        "observed_tool" => json!("Bash"),
         "job_id" => json!("job_123"),
         "idempotency_key" => json!("sample-detached-key"),
         "handle" => json!("reviewer"),
@@ -164,6 +167,7 @@ fn sample_field_value(field: &str) -> Value {
         "id" => json!("private-drop"),
         "base_commit" => json!("a".repeat(40)),
         "head_commit" => json!("b".repeat(40)),
+        "scope" => json!({"kind": "workspace"}),
         "expected_head" => json!("a".repeat(40)),
         "expected_generation" => json!(1),
         "expected_revision" => json!(format!("sha256:{}", "a".repeat(64))),

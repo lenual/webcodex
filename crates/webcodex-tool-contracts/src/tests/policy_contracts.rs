@@ -187,7 +187,7 @@ fn tool_definitions_drive_session_and_permission_policy() {
     for (name, effect, risk) in [
         ("apply_patch", ToolEffect::Mutate, ToolRisk::ProjectWrite),
         (
-            "apply_text_edits",
+            "edit_project_files",
             ToolEffect::Mutate,
             ToolRisk::ProjectWrite,
         ),
@@ -413,7 +413,12 @@ fn tool_definitions_drive_session_and_permission_policy() {
         .collect::<Vec<_>>();
     assert_eq!(
         change_summary_tools,
-        vec!["git_review_summary", "show_changes", "git_diff_hunks",]
+        vec![
+            "git_review_summary",
+            "review_changes",
+            "show_changes",
+            "git_diff_hunks",
+        ]
     );
 
     let validation_output_tools = tool_definitions()
@@ -432,8 +437,9 @@ fn tool_definitions_drive_session_and_permission_policy() {
     assert_eq!(
         explicit_business_session_tools,
         vec![
+            "record_external_observation",
+            "list_external_observations",
             "finish_coding_task",
-            "present_work_result",
             "session_summary",
             "update_session_context",
             "close_session",
@@ -446,6 +452,7 @@ fn tool_definitions_drive_session_and_permission_policy() {
             "complete_session_message",
             "session_discussion_summary",
             "session_handoff_summary",
+            "session_handoff_state",
             #[cfg(feature = "experimental-code-mode")]
             "code_mode_exec",
             #[cfg(feature = "experimental-code-mode")]
@@ -502,7 +509,7 @@ fn tool_definitions_drive_session_and_permission_policy() {
         #[cfg(feature = "workspace-checkpoints")]
         ("workspace_checkpoint_restore", PERMISSION_RISK_PATCH),
         ("write_project_file", PERMISSION_RISK_WRITE),
-        ("apply_text_edits", PERMISSION_RISK_WRITE),
+        ("edit_project_files", PERMISSION_RISK_WRITE),
         ("assign_agent_task", PERMISSION_RISK_WRITE),
         ("reconcile_agent_task_coding_run", PERMISSION_RISK_WRITE),
         ("heartbeat_agent_task_attempt", PERMISSION_RISK_WRITE),
@@ -698,7 +705,7 @@ fn required_runner_capability_matches_metadata_risk_table() {
             RunnerCapabilityRequirement::FileWrite,
         ),
         (
-            "apply_text_edits",
+            "edit_project_files",
             ToolRisk::ProjectWrite,
             RunnerCapabilityRequirement::FileWrite,
         ),
@@ -714,6 +721,11 @@ fn required_runner_capability_matches_metadata_risk_table() {
         ),
         (
             "git_review_summary",
+            ToolRisk::Read,
+            RunnerCapabilityRequirement::GitOrShell,
+        ),
+        (
+            "review_changes",
             ToolRisk::Read,
             RunnerCapabilityRequirement::GitOrShell,
         ),

@@ -15,7 +15,7 @@ use super::{
     CommandResult, HotRunnerConfig, PersistentShellManager, ReloadableRunnerConfig, RunnerSink,
     ShellCommandResult, SubmitResultError,
 };
-use crate::handle_file_operation;
+use crate::handle_file_operation_with_artifact_store;
 use crate::runner_protocol::{
     PersistentShellResult, RunnerConfigAction, RunnerConfigOperationRequest,
     RunnerJobUpdateRequest, RunnerRequest, EXTERNAL_SEARCH_REQUEST_PREFIX,
@@ -148,6 +148,8 @@ fn run_native_shell_or_internal_search(
         jobs.prepared_profiles(),
         operation.cwd.as_deref(),
         &operation.command,
+        operation.shell,
+        operation.login,
         operation.stdin.as_deref(),
         operation.timeout_secs,
         Some(runtime.shutdown_flag()),
@@ -206,8 +208,6 @@ fn submit_invalid_job_start(sink: &RunnerSink, request: &RunnerRequest, error: S
         status: "failed".to_string(),
         stdout_chunk: None,
         stderr_chunk: None,
-        stdout_tail: None,
-        stderr_tail: None,
         log_snapshot: None,
         exit_code: None,
         duration_ms: Some(0),
@@ -485,7 +485,11 @@ pub(crate) fn dispatch_request_with_outcome(
                 .map(|_| true)
         }
         RunnerOperation::Computer(operation) => {
-            let result = handle_computer_operation(&operation);
+            let result = if super::computer_session::configured() {
+                super::computer_session::dispatch(&operation)
+            } else {
+                handle_computer_operation(&operation)
+            };
             sink.submit_result_with_metadata(request_id, result, config, runtime)
                 .map(|_| true)
         }
@@ -617,6 +621,19 @@ pub(crate) fn dispatch_request_with_outcome(
                 };
                 sink.submit_shell_result_with_metadata(request_id, result, config, runtime)
                     .map(|_| true)
+            } else if operation.shell.is_some() {
+                // An explicit semantic shell selection is authoritative. Do not
+                // let command-shape routing consume the request under another
+                // interpreter before the native selector is applied.
+                let result = run_native_shell_or_internal_search(
+                    config,
+                    runtime,
+                    jobs,
+                    project_registry_dir,
+                    &operation,
+                );
+                sink.submit_shell_result_with_metadata(request_id, result, config, runtime)
+                    .map(|_| true)
             } else {
                 match config.external_tools.route_with_shutdown(
                     policy,
@@ -655,7 +672,11 @@ pub(crate) fn dispatch_request_with_outcome(
             }
         }
         RunnerOperation::File(operation) => {
-            let result = handle_file_operation(policy, &operation);
+            let result = handle_file_operation_with_artifact_store(
+                policy,
+                &operation,
+                Some(project_registry_dir),
+            );
             sink.submit_result_with_metadata(request_id, result, config, runtime)
                 .map(|_| true)
         }

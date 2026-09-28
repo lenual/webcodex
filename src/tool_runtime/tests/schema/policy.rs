@@ -137,7 +137,7 @@ fn required_runner_capability_matches_metadata_risk_table() {
             RunnerCapabilityRequirement::FileWrite,
         ),
         (
-            "apply_text_edits",
+            "edit_project_files",
             ToolRisk::ProjectWrite,
             RunnerCapabilityRequirement::FileWrite,
         ),
@@ -153,6 +153,11 @@ fn required_runner_capability_matches_metadata_risk_table() {
         ),
         (
             "git_review_summary",
+            ToolRisk::Read,
+            RunnerCapabilityRequirement::GitOrShell,
+        ),
+        (
+            "review_changes",
             ToolRisk::Read,
             RunnerCapabilityRequirement::GitOrShell,
         ),

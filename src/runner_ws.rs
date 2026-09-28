@@ -18,7 +18,7 @@
 //! Polling remains a fully supported fallback transport.
 
 use crate::runner_http::{RunnerRegistry, RunnerTransport};
-use crate::runner_protocol::{RunnerEnvelope, RunnerRegisterRequest};
+use crate::runner_protocol::{RunnerEnvelope, RunnerRegisterRequest, RUNNER_ENVELOPE_MAX_BYTES};
 use futures_util::{SinkExt, StreamExt};
 use salvo::prelude::*;
 use salvo::websocket::{Message, WebSocket, WebSocketUpgrade};
@@ -27,10 +27,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 
-/// Maximum WebSocket text message size. Runner requests/results carry shell
-/// output which can be sizeable; 8 MiB matches the registry output cap head
-/// room while still bounding memory.
-const WS_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
+/// Maximum WebSocket text message size. Keep it aligned with the shared
+/// transport-neutral Runner envelope budget.
+const WS_MAX_MESSAGE_SIZE: usize = RUNNER_ENVELOPE_MAX_BYTES;
 /// Deadline for the Runner to send its first `Register` envelope after the
 /// handshake. Prevents half-open connections from holding registry state.
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(15);
@@ -373,6 +372,7 @@ mod tests {
     fn register_envelope_with_instance(client_id: &str, instance_id: &str) -> RunnerEnvelope {
         RunnerEnvelope::Register {
             payload: RunnerRegisterRequest {
+                computer_session_availability: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -389,6 +389,8 @@ mod tests {
                 capabilities: crate::test_support::current_runner_capabilities(
                     RunnerCapabilities {
                         shell: true,
+                        explicit_shell_selection: false,
+                        bash_login_shell: false,
                         file_read: true,
                         file_write: true,
                         artifact_export_chunk_read: false,
@@ -396,6 +398,8 @@ mod tests {
                         structured_file_delete: true,
                         apply_text_edit_occurrence: false,
                         apply_text_edit_line_scope: false,
+                        apply_text_edit_range: false,
+                        apply_text_edit_expected_match_count: false,
                         apply_text_edit_local_guard_without_sha: false,
                         apply_patch: false,
                         apply_patch_match_metadata: false,
@@ -411,6 +415,7 @@ mod tests {
                         structured_cargo_test_count_assertion: true,
                         structured_cargo_test_execution_policy: true,
                         structured_cargo_test_lib: true,
+                        structured_cargo_check_packages: true,
                         structured_go_test_json: true,
                         structured_go_test_tool: true,
                         structured_go_test_packages: true,
@@ -418,6 +423,7 @@ mod tests {
                         structured_script_payload: false,
                         structured_script_javascript: false,
                         structured_script_typescript: false,
+                        structured_script_python: false,
                         internal_posix_script: false,
                         structured_execution_jobs: false,
                         detached_process_jobs: false,
@@ -431,6 +437,7 @@ mod tests {
                         skill_management: false,
                         browser_observe: false,
                         browser_control: false,
+                        browser_element_action_admission: false,
                         browser_launch: false,
                         computer_observe: false,
                         computer_application_discovery: false,
@@ -659,6 +666,7 @@ mod tests {
         let (request_id, mut result_rx) = registry
             .enqueue_run(
                 ShellRunRequest {
+                    login: false,
                     client_id: "shared-a".to_string(),
                     cwd: None,
                     command: "echo shared-a".to_string(),
@@ -825,6 +833,7 @@ mod tests {
         let (request_id, rx) = registry
             .enqueue_run(
                 ShellRunRequest {
+                    login: false,
                     client_id: "ws-roundtrip".to_string(),
                     cwd: None,
                     command: "echo hi".to_string(),
@@ -881,6 +890,7 @@ mod tests {
 
         ws.send(TungsteniteMessage::Text(
             RunnerEnvelope::RuntimeMetadata {
+                computer_session_availability: None,
                 tool_providers: provider_status(),
                 mcp_gateway_providers: Some(vec![crate::mcp_gateway::McpGatewayProvider {
                     provider_id: "blender".to_string(),
@@ -1187,6 +1197,7 @@ mod tests {
                 let (request_id, rx) = registry
                     .enqueue_run(
                         ShellRunRequest {
+                            login: false,
                             client_id: "ws-slow".to_string(),
                             cwd: None,
                             command: "echo hi".to_string(),
@@ -1264,6 +1275,7 @@ mod tests {
         let job = registry
             .start_job(
                 ShellJobOpRequest {
+                    login: false,
                     op: "start".to_string(),
                     client_id: Some("ws-lost".to_string()),
                     cwd: None,
@@ -1495,6 +1507,7 @@ mod tests {
         let job = registry
             .start_job(
                 ShellJobOpRequest {
+                    login: false,
                     op: "start".to_string(),
                     client_id: Some("ws-stale-disc".to_string()),
                     cwd: None,
@@ -1673,6 +1686,7 @@ mod tests {
         let (request_id, _rx) = registry
             .enqueue_run(
                 ShellRunRequest {
+                    login: false,
                     client_id: "ws-steal".to_string(),
                     cwd: None,
                     command: "echo hi".to_string(),

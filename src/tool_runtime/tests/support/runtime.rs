@@ -59,7 +59,7 @@ pub(in crate::tool_runtime::tests) fn sample_tool_args_for_spec(spec: &ToolSpec)
         "work_on_project" => {
             args.insert("project".to_string(), json!(SAMPLE_PROJECT));
         }
-        "update_goal" => {
+        "update_goal" | "checkpoint_goal" => {
             args.insert("expected_revision".to_string(), json!(1));
         }
         "observe_jobs" => {
@@ -123,6 +123,7 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "content" => json!("fn main() {}\n"),
         "instruction" => json!("implement the requested change"),
         "objective" => json!("Preserve durable high-level intent without execution authority."),
+        "summary" => json!("Recovery-worthy checkpoint summary"),
         "title" => json!("Durable agent work"),
         "include_extension_catalog" => json!(false),
         "content_base64" => json!("AA=="),
@@ -172,6 +173,8 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "provider_id" => json!("codex"),
         "run_id" => json!("wc_agent_run_sample_1234"),
         "shell_id" => json!("wc_shell_123"),
+        "adapter_id" | "event_id" => json!("a".repeat(64)),
+        "observed_tool" => json!("Bash"),
         "session_id" => json!(format!("wc_sess_{}", "1".repeat(32))),
         "checkpoint_id" => json!("wc_ckpt_1234"),
         "confirm" => json!(true),
@@ -187,6 +190,7 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "id" => json!("private-drop"),
         "base_commit" => json!("a".repeat(40)),
         "head_commit" => json!("b".repeat(40)),
+        "scope" => json!({"kind": "workspace"}),
         "expected_head" => json!("a".repeat(40)),
         "expected_revision" => json!(format!("sha256:{}", "a".repeat(64))),
         "name" => json!("Private Drop"),
