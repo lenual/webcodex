@@ -1,6 +1,7 @@
 # A11yChat
 
 A11yChat 是一个面向 Windows ChatGPT Desktop 的无障碍/自动化命令行工具。
+D:\WebCodex\A11yChat\dist\A11yChat.exe launch
 
 它通过 **CDP（Chrome DevTools Protocol）连接 ChatGPT Desktop 自身的 Electron renderer**，调用普通 Chat 模式现有的内部提交与读取路径，从而可以在后台：
 
